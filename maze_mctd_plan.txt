@@ -1,0 +1,1770 @@
+# Maze-MCTD: Hidden-Space Monte Carlo Tree Diffusion for Maze Navigation
+
+## Project Overview
+
+This project implements Monte Carlo Tree Diffusion (MCTD) in continuous hidden space for discrete maze navigation, serving as a testbed for diffusion language model (dLLM) techniques before scaling to full language tasks.
+
+**Core Innovation**: Search over continuous hidden representations that denoise into discrete action sequences, enabling:
+- Tree search in hidden space (no discrete token bottlenecks)
+- Hierarchical planning (coarse waypoints → detailed actions)
+- Adversarial masking based on tree statistics
+- Direct transferability to dLLM reasoning tasks
+
+**Environment**: MiniGrid discrete maze navigation (pip installable, 7 discrete actions)
+
+**Development Strategy**: 
+- Phase 1-3: Local development on M1 MacBook (small models, fast iteration)
+- Phase 4-6: Cloud GPU training (larger models, serious experiments)
+
+---
+
+## Repository Structure
+
+```
+maze-mctd/
+├── README.md
+├── setup.py
+├── requirements.txt
+├── configs/
+│   ├── base_config.yaml           # Base configuration
+│   ├── experiments/
+│   │   ├── baseline_mdlm.yaml     # Vanilla masked diffusion
+│   │   ├── mctd_vanilla.yaml      # Standard MCTD
+│   │   ├── mctd_hierarchical.yaml # Hierarchical planner/executor
+│   │   ├── mctd_adversarial.yaml  # With adversarial masking
+│   │   └── mctd_parallel.yaml     # P-MCTD speedups
+│   └── env/
+│       ├── empty_8x8.yaml
+│       ├── four_rooms.yaml
+│       ├── door_key.yaml
+│       └── multi_room_n6.yaml
+│
+├── src/
+│   ├── __init__.py
+│   ├── environments/
+│   │   ├── __init__.py
+│   │   ├── minigrid_wrapper.py    # Wrapper for MiniGrid
+│   │   ├── trajectory_dataset.py  # Dataset of solved trajectories
+│   │   └── branch_point_detector.py # Identify decision points
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── action_encoder.py      # Discrete actions → continuous embeddings
+│   │   ├── state_encoder.py       # Grid observations → embeddings
+│   │   ├── diffusion_policy.py    # Core dLLM for action sequences
+│   │   ├── components/
+│   │   │   ├── dit_block.py       # DiT transformer blocks
+│   │   │   ├── timestep_embed.py  # Diffusion timestep embeddings
+│   │   │   └── attention.py       # Attention mechanisms
+│   │   └── hierarchical/
+│   │       ├── planner.py         # Coarse waypoint planner
+│   │       └── executor.py        # Fine-grained action executor
+│   │
+│   ├── mctd/
+│   │   ├── __init__.py
+│   │   ├── tree.py                # MCTS tree structure
+│   │   ├── node.py                # Tree node with hidden states
+│   │   ├── search.py              # Core MCTD algorithm
+│   │   ├── selection.py           # UCT selection policy
+│   │   ├── expansion.py           # Node expansion strategies
+│   │   ├── simulation.py          # Fast rollout (jumpy denoising)
+│   │   ├── backpropagation.py     # Value backprop through tree
+│   │   └── parallel/
+│   │       ├── parallel_mctd.py   # P-MCTD implementation
+│   │       └── redundancy_aware.py # RAS selection
+│   │
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── mdlm_trainer.py        # Standard masked diffusion training
+│   │   ├── adversarial_trainer.py # Tree-guided adversarial masking
+│   │   ├── grpo_trainer.py        # GRPO-style RL fine-tuning
+│   │   └── losses.py              # Loss functions
+│   │
+│   ├── analysis/
+│   │   ├── __init__.py
+│   │   ├── hidden_state_analyzer.py # Analyze h at branch points
+│   │   ├── tree_statistics.py     # Collect visit counts, Q-values
+│   │   ├── attention_visualizer.py # Visualize attention patterns
+│   │   └── trajectory_visualizer.py # Render maze solutions
+│   │
+│   └── utils/
+│       ├── __init__.py
+│       ├── config.py              # Config loading
+│       ├── checkpointing.py       # Model saving/loading
+│       ├── logging.py             # Wandb/tensorboard
+│       └── metrics.py             # Success rate, path length, etc.
+│
+├── scripts/
+│   ├── generate_expert_data.py    # Collect trajectories via A* or hand-coded policy
+│   ├── train_baseline.py          # Train vanilla MDLM
+│   ├── train_mctd.py              # Train with MCTD exploration
+│   ├── evaluate.py                # Evaluation script
+│   └── visualize_tree.py          # Visualize MCTD tree search
+│
+├── notebooks/
+│   ├── 01_environment_exploration.ipynb
+│   ├── 02_baseline_training.ipynb
+│   ├── 03_mctd_search_analysis.ipynb
+│   ├── 04_hidden_state_analysis.ipynb
+│   └── 05_adversarial_masking.ipynb
+│
+└── tests/
+    ├── test_environment.py
+    ├── test_models.py
+    ├── test_mctd.py
+    └── test_training.py
+```
+
+---
+
+## Dependencies
+
+```yaml
+# requirements.txt
+torch>=2.0.0
+gymnasium>=0.29.0
+minigrid>=2.3.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+wandb>=0.15.0
+pyyaml>=6.0
+tqdm>=4.65.0
+pytest>=7.4.0
+
+# Optional for visualization
+pillow>=9.5.0
+imageio>=2.31.0
+```
+
+**M1 MacBook Setup**:
+```bash
+# Use MPS backend for GPU acceleration on M1
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
+
+---
+
+## Implementation Phases
+
+### Phase 1: Foundation (Week 1) - **M1 MacBook**
+
+**Goal**: Get basic environment working and collect expert data.
+
+**Model Size**: Tiny (for fast local iteration)
+- Hidden dim: 64-128
+- Layers: 2-4
+- Parameters: ~100K-500K
+
+**Tasks**:
+1. ✅ MiniGrid wrapper with state extraction
+2. ✅ Expert trajectory generation (A* search)
+3. ✅ Action encoder (discrete → continuous)
+4. ✅ Basic visualization tools
+
+#### Key Implementation: Environment Wrapper
+
+```python
+# src/environments/minigrid_wrapper.py
+import gymnasium as gym
+import numpy as np
+import torch
+
+class MazeEnvironment:
+    """
+    Wrapper for MiniGrid environments.
+    Provides state embeddings and branch point detection.
+    """
+    def __init__(self, env_name="MiniGrid-Empty-8x8-v0", max_steps=100):
+        self.env = gym.make(env_name)
+        self.action_space = 7  # left, right, forward, pickup, drop, toggle, done
+        self.max_steps = max_steps
+        
+    def reset(self):
+        """Reset environment and return initial state"""
+        obs, info = self.env.reset()
+        return self.get_state_embedding(obs)
+    
+    def step(self, action):
+        """Execute action and return (state, reward, done, info)"""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+        return self.get_state_embedding(obs), reward, done, info
+    
+    def get_state_embedding(self, obs):
+        """
+        Convert MiniGrid observation to state representation.
+        
+        obs['image']: (7, 7, 3) partially observable view
+            - Channel 0: object type
+            - Channel 1: object color
+            - Channel 2: object state
+        obs['direction']: agent direction (0-3)
+        
+        Returns: dict with
+            - 'grid': flattened grid observation
+            - 'position': (x, y) if available
+            - 'direction': facing direction
+        """
+        grid_flat = obs['image'].flatten()
+        direction = obs['direction']
+        
+        # Try to get absolute position (available in some envs)
+        position = getattr(self.env.unwrapped, 'agent_pos', None)
+        
+        return {
+            'grid': torch.tensor(grid_flat, dtype=torch.float32),
+            'direction': torch.tensor(direction, dtype=torch.long),
+            'position': torch.tensor(position, dtype=torch.long) if position is not None else None
+        }
+    
+    def get_branch_points(self, trajectory):
+        """
+        Identify decision points in a trajectory.
+        
+        Branch points are positions where:
+        - Multiple valid actions exist
+        - Near doorways or intersections
+        - Key objects nearby
+        
+        Args:
+            trajectory: List of (state, action, reward) tuples
+            
+        Returns:
+            List of indices where branching occurs
+        """
+        branch_indices = []
+        
+        for i, (state, action, reward) in enumerate(trajectory):
+            # Heuristic: detect grid cells with multiple open neighbors
+            grid = state['grid'].reshape(7, 7, 3)
+            
+            # Count empty adjacent cells (simplified)
+            # This is a placeholder - implement proper branch detection
+            if self._is_branch_point(grid):
+                branch_indices.append(i)
+        
+        return branch_indices
+    
+    def _is_branch_point(self, grid):
+        """Heuristic to detect if current position is a branch point"""
+        # Center of observable grid
+        center = grid[3, 3]
+        
+        # Count empty neighbors (object type == 1 for empty)
+        neighbors = [
+            grid[2, 3, 0],  # forward
+            grid[3, 2, 0],  # left
+            grid[3, 4, 0],  # right
+        ]
+        
+        empty_count = sum(n == 1 for n in neighbors)
+        return empty_count >= 2  # Branch if 2+ directions available
+```
+
+#### Key Implementation: Expert Data Generation
+
+```python
+# scripts/generate_expert_data.py
+import gymnasium as gym
+import numpy as np
+from pathlib import Path
+import pickle
+from tqdm import tqdm
+
+def bfs_solve_maze(env):
+    """
+    Use BFS to find shortest path in MiniGrid environment.
+    
+    Returns:
+        trajectory: List of (state, action) pairs
+        success: Whether goal was reached
+    """
+    from collections import deque
+    
+    # Reset environment
+    obs, _ = env.reset()
+    
+    # BFS queue: (state, action_sequence)
+    queue = deque([(obs, [])])
+    visited = set()
+    
+    max_iterations = 10000
+    iterations = 0
+    
+    while queue and iterations < max_iterations:
+        current_obs, actions = queue.popleft()
+        
+        # Create state hash for visited check
+        state_hash = hash(current_obs['image'].tobytes())
+        if state_hash in visited:
+            continue
+        visited.add(state_hash)
+        
+        # Try all actions
+        for action in range(7):
+            # Clone environment state
+            env_copy = env.unwrapped
+            
+            # Try action
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            
+            # Check if reached goal
+            if terminated and reward > 0:
+                return actions + [action], True
+            
+            # Add to queue if not done
+            if not (terminated or truncated):
+                queue.append((next_obs, actions + [action]))
+        
+        iterations += 1
+    
+    return [], False
+
+def generate_expert_dataset(
+    env_name="MiniGrid-Empty-8x8-v0",
+    num_episodes=1000,
+    output_path="data/expert_trajectories.pkl"
+):
+    """Generate dataset of expert trajectories using BFS"""
+    
+    env = gym.make(env_name)
+    trajectories = []
+    
+    print(f"Generating {num_episodes} expert trajectories for {env_name}")
+    
+    for episode in tqdm(range(num_episodes)):
+        # Reset environment
+        obs, _ = env.reset()
+        
+        # Solve with BFS
+        actions, success = bfs_solve_maze(env)
+        
+        if not success:
+            continue
+        
+        # Collect full trajectory with observations
+        obs, _ = env.reset()
+        trajectory = []
+        
+        for action in actions:
+            state = {
+                'grid': obs['image'].flatten(),
+                'direction': obs['direction'],
+            }
+            
+            trajectory.append({
+                'state': state,
+                'action': action,
+            })
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            if terminated or truncated:
+                break
+        
+        trajectories.append({
+            'states': [t['state'] for t in trajectory],
+            'actions': [t['action'] for t in trajectory],
+            'length': len(trajectory),
+        })
+    
+    # Save dataset
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'wb') as f:
+        pickle.dump(trajectories, f)
+    
+    print(f"Saved {len(trajectories)} trajectories to {output_path}")
+    print(f"Average trajectory length: {np.mean([t['length'] for t in trajectories]):.1f}")
+    
+    return trajectories
+
+if __name__ == "__main__":
+    # Generate data for multiple environments
+    envs = [
+        "MiniGrid-Empty-8x8-v0",
+        "MiniGrid-FourRooms-v0",
+    ]
+    
+    for env_name in envs:
+        generate_expert_dataset(env_name, num_episodes=500)
+```
+
+#### Key Implementation: Action Encoder
+
+```python
+# src/models/action_encoder.py
+import torch
+import torch.nn as nn
+
+class ActionEncoder(nn.Module):
+    """
+    Encode discrete actions as continuous hidden states.
+    
+    This allows diffusion to operate in continuous space while
+    maintaining discrete action semantics.
+    """
+    def __init__(self, num_actions=7, hidden_dim=128):
+        super().__init__()
+        self.num_actions = num_actions
+        self.hidden_dim = hidden_dim
+        
+        # Learnable embeddings for each action
+        self.action_embedding = nn.Embedding(num_actions, hidden_dim)
+        
+        # Optional projection layer
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+    
+    def forward(self, actions):
+        """
+        Args:
+            actions: [batch, seq_len] discrete action indices
+            
+        Returns:
+            [batch, seq_len, hidden_dim] continuous embeddings
+        """
+        embeds = self.action_embedding(actions)
+        return self.proj(embeds)
+    
+    def decode(self, hidden_states):
+        """
+        Decode continuous hidden states back to action logits.
+        
+        Args:
+            hidden_states: [batch, seq_len, hidden_dim]
+            
+        Returns:
+            [batch, seq_len, num_actions] logits
+        """
+        # Compute similarity to each action embedding
+        # [batch, seq_len, hidden_dim] @ [hidden_dim, num_actions]
+        action_embeds = self.action_embedding.weight.t()  # [hidden_dim, num_actions]
+        logits = torch.matmul(hidden_states, action_embeds)
+        return logits
+
+class StateEncoder(nn.Module):
+    """
+    Encode MiniGrid observations into fixed-size embeddings.
+    """
+    def __init__(self, grid_size=7, hidden_dim=128):
+        super().__init__()
+        
+        # Grid observation is 7x7x3 = 147 dimensional
+        self.grid_size = grid_size
+        self.input_dim = grid_size * grid_size * 3
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+        
+        # Separate encoding for direction
+        self.direction_embed = nn.Embedding(4, hidden_dim)
+    
+    def forward(self, state_dict):
+        """
+        Args:
+            state_dict: dict with 'grid' and 'direction' keys
+            
+        Returns:
+            [batch, hidden_dim] state embedding
+        """
+        grid_embed = self.encoder(state_dict['grid'])
+        dir_embed = self.direction_embed(state_dict['direction'])
+        
+        # Combine with addition (could also use concatenation)
+        return grid_embed + dir_embed
+```
+
+**Week 1 Deliverables**:
+- ✅ Working MiniGrid environment wrapper
+- ✅ 500+ expert trajectories for Empty-8x8 and FourRooms
+- ✅ Action/state encoders with tests
+- ✅ Trajectory visualization notebook
+
+---
+
+### Phase 2: Baseline Diffusion Model (Week 2) - **M1 MacBook**
+
+**Goal**: Train vanilla masked diffusion policy on expert trajectories.
+
+**Model Size**: Small (still local)
+- Hidden dim: 128
+- Layers: 4-6
+- Heads: 4
+- Parameters: ~1-2M
+
+**Tasks**:
+1. ✅ DiT-based diffusion policy
+2. ✅ Masked diffusion training loop
+3. ✅ Evaluation on test mazes
+4. ✅ Baseline metrics (success rate, path length)
+
+#### Key Implementation: Diffusion Policy
+
+```python
+# src/models/diffusion_policy.py
+import torch
+import torch.nn as nn
+import math
+
+class SinusoidalPositionEmbedding(nn.Module):
+    """Timestep embedding for diffusion"""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, t):
+        """
+        Args:
+            t: [batch] timestep values in [0, 1]
+        Returns:
+            [batch, dim] embeddings
+        """
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        return emb
+
+class DiTBlock(nn.Module):
+    """Transformer block with adaptive layer norm (DiT style)"""
+    def __init__(self, hidden_dim, num_heads, dropout=0.1):
+        super().__init__()
+        
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            hidden_dim, 
+            num_heads, 
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        
+        # Adaptive layer norm conditioning on timestep
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 6)
+        )
+    
+    def forward(self, x, t_emb):
+        """
+        Args:
+            x: [batch, seq_len, hidden_dim]
+            t_emb: [batch, hidden_dim] timestep embedding
+        """
+        # Adaptive LayerNorm parameters
+        ada_params = self.adaLN(t_emb)  # [batch, hidden_dim * 6]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            ada_params.chunk(6, dim=-1)
+        
+        # Self-attention with adaptive norm
+        normed = self.norm1(x)
+        normed = normed * (1 + scale_msa[:, None, :]) + shift_msa[:, None, :]
+        attn_out, _ = self.attn(normed, normed, normed)
+        x = x + gate_msa[:, None, :] * attn_out
+        
+        # MLP with adaptive norm
+        normed = self.norm2(x)
+        normed = normed * (1 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
+        mlp_out = self.mlp(normed)
+        x = x + gate_mlp[:, None, :] * mlp_out
+        
+        return x
+
+class DiffusionPolicy(nn.Module):
+    """
+    Masked Diffusion Language Model for action sequences.
+    
+    Operates on continuous hidden action representations,
+    decodes to discrete action logits.
+    """
+    def __init__(
+        self,
+        num_actions=7,
+        hidden_dim=128,
+        num_layers=6,
+        num_heads=4,
+        max_seq_len=64,
+        dropout=0.1,
+    ):
+        super().__init__()
+        
+        self.num_actions = num_actions
+        self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
+        
+        # Encoders
+        self.state_encoder = StateEncoder(hidden_dim=hidden_dim)
+        self.action_encoder = ActionEncoder(num_actions, hidden_dim)
+        
+        # Timestep embedding
+        self.time_embed = nn.Sequential(
+            SinusoidalPositionEmbedding(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        
+        # Position embeddings for sequence
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, max_seq_len, hidden_dim) * 0.02
+        )
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Output head
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.action_head = nn.Linear(hidden_dim, num_actions)
+    
+    def forward(self, noisy_actions, state, t, mask=None):
+        """
+        Denoise action sequence conditioned on state and timestep.
+        
+        Args:
+            noisy_actions: [B, L, D] continuous hidden action states
+            state: dict with grid and direction
+            t: [B] diffusion timestep in [0, 1]
+            mask: [B, L] binary mask (1 = masked position)
+            
+        Returns:
+            [B, L, num_actions] denoised action logits
+        """
+        B, L, D = noisy_actions.shape
+        
+        # Encode state
+        state_emb = self.state_encoder(state)  # [B, D]
+        
+        # Encode timestep
+        t_emb = self.time_embed(t)  # [B, D]
+        
+        # Combine state and time conditioning
+        cond_emb = state_emb + t_emb  # [B, D]
+        
+        # Add positional embeddings to actions
+        x = noisy_actions + self.pos_embed[:, :L, :]
+        
+        # Apply transformer blocks with conditioning
+        for block in self.blocks:
+            x = block(x, cond_emb)
+        
+        # Output
+        x = self.final_norm(x)
+        logits = self.action_head(x)  # [B, L, num_actions]
+        
+        return logits
+    
+    def denoise_step(self, hidden_actions, state, t, guidance_scale=1.0):
+        """
+        Single denoising step (for MCTD inference).
+        
+        Args:
+            hidden_actions: [B, L, D]
+            state: state dict
+            t: [B] current noise level
+            guidance_scale: float, classifier-free guidance strength
+            
+        Returns:
+            [B, L, D] less noisy hidden actions
+        """
+        # Forward pass
+        logits = self.forward(hidden_actions, state, t)
+        
+        # Get predicted clean actions
+        pred_actions = logits.argmax(dim=-1)  # [B, L]
+        
+        # Encode to hidden space
+        clean_hidden = self.action_encoder(pred_actions)
+        
+        # Denoising update (DDPM-style)
+        # x_t-1 = alpha * clean_pred + beta * noise
+        # Simplified: interpolate toward clean prediction
+        alpha = 1.0 - t[:, None, None]  # More clean as t → 0
+        denoised = alpha * clean_hidden + (1 - alpha) * hidden_actions
+        
+        # Optional: classifier-free guidance
+        if guidance_scale != 1.0:
+            # Compute unconditional prediction
+            uncond_logits = self.forward(
+                hidden_actions, 
+                state, 
+                t, 
+                mask=torch.ones_like(hidden_actions[..., 0])
+            )
+            uncond_actions = uncond_logits.argmax(dim=-1)
+            uncond_hidden = self.action_encoder(uncond_actions)
+            
+            # Guidance: move away from uncond toward cond
+            denoised = uncond_hidden + guidance_scale * (denoised - uncond_hidden)
+        
+        return denoised
+```
+
+#### Key Implementation: Training Loop
+
+```python
+# src/training/mdlm_trainer.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import wandb
+
+class MaskedDiffusionTrainer:
+    """
+    Trainer for Masked Diffusion Language Model (MDLM).
+    
+    Implements the masking schedule and loss from MDLM paper.
+    """
+    def __init__(
+        self,
+        model,
+        train_dataset,
+        val_dataset,
+        config,
+        device='mps',  # M1 MacBook
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.config = config
+        
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=0,  # Single-threaded for M1
+        )
+        
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            shuffle=False,
+            num_workers=0,
+        )
+        
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay'],
+        )
+        
+        self.criterion = nn.CrossEntropyLoss(reduction='none')
+        
+        # Masking schedule
+        self.num_steps = config['num_diffusion_steps']
+    
+    def get_mask_ratio(self, t):
+        """
+        Mask ratio as function of timestep t in [0, 1].
+        
+        Common schedules:
+        - Linear: t
+        - Cosine: cos(π/2 * (1-t))
+        - Constant: 0.15 (BERT-style)
+        """
+        schedule = self.config.get('mask_schedule', 'cosine')
+        
+        if schedule == 'linear':
+            return t
+        elif schedule == 'cosine':
+            return torch.cos(torch.pi / 2 * (1 - t))
+        elif schedule == 'constant':
+            return torch.full_like(t, 0.15)
+        else:
+            raise ValueError(f"Unknown schedule: {schedule}")
+    
+    def create_mask(self, batch_size, seq_len, t):
+        """
+        Create random mask with ratio determined by timestep.
+        
+        Returns:
+            [batch, seq_len] binary mask (1 = masked)
+        """
+        mask_ratio = self.get_mask_ratio(t)
+        
+        # Random masks for each sequence
+        masks = []
+        for i in range(batch_size):
+            mask = torch.rand(seq_len, device=self.device) < mask_ratio[i]
+            masks.append(mask)
+        
+        return torch.stack(masks)
+    
+    def train_step(self, batch):
+        """Single training step"""
+        self.model.train()
+        
+        # Unpack batch
+        states = {k: v.to(self.device) for k, v in batch['states'].items()}
+        actions = batch['actions'].to(self.device)  # [B, L]
+        
+        B, L = actions.shape
+        
+        # Sample random timestep
+        t = torch.rand(B, device=self.device)
+        
+        # Create mask
+        mask = self.create_mask(B, L, t)
+        
+        # Encode actions to hidden space
+        clean_hidden = self.model.action_encoder(actions)  # [B, L, D]
+        
+        # Add noise to masked positions
+        noise = torch.randn_like(clean_hidden)
+        noisy_hidden = torch.where(
+            mask[..., None],
+            noise,
+            clean_hidden
+        )
+        
+        # Forward pass
+        logits = self.model(noisy_hidden, states, t, mask)  # [B, L, num_actions]
+        
+        # Compute loss only on masked positions
+        loss_per_token = self.criterion(
+            logits.reshape(-1, self.model.num_actions),
+            actions.reshape(-1)
+        ).reshape(B, L)
+        
+        loss = (loss_per_token * mask).sum() / mask.sum()
+        
+        # Backward
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        
+        # Metrics
+        with torch.no_grad():
+            pred_actions = logits.argmax(dim=-1)
+            accuracy = ((pred_actions == actions) * mask).sum() / mask.sum()
+        
+        return {
+            'loss': loss.item(),
+            'accuracy': accuracy.item(),
+            'mask_ratio': mask.float().mean().item(),
+        }
+    
+    def train_epoch(self, epoch):
+        """Train for one epoch"""
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        
+        metrics_sum = {'loss': 0, 'accuracy': 0, 'mask_ratio': 0}
+        
+        for batch in pbar:
+            metrics = self.train_step(batch)
+            
+            for k, v in metrics.items():
+                metrics_sum[k] += v
+            
+            pbar.set_postfix({
+                k: v / (pbar.n + 1) for k, v in metrics_sum.items()
+            })
+        
+        return {k: v / len(self.train_loader) for k, v in metrics_sum.items()}
+    
+    @torch.no_grad()
+    def evaluate(self):
+        """Evaluate on validation set"""
+        self.model.eval()
+        
+        metrics_sum = {'loss': 0, 'accuracy': 0}
+        
+        for batch in tqdm(self.val_loader, desc="Evaluating"):
+            states = {k: v.to(self.device) for k, v in batch['states'].items()}
+            actions = batch['actions'].to(self.device)
+            
+            B, L = actions.shape
+            t = torch.ones(B, device=self.device) * 0.5  # Fixed t for eval
+            mask = self.create_mask(B, L, t)
+            
+            clean_hidden = self.model.action_encoder(actions)
+            noise = torch.randn_like(clean_hidden)
+            noisy_hidden = torch.where(mask[..., None], noise, clean_hidden)
+            
+            logits = self.model(noisy_hidden, states, t, mask)
+            
+            loss_per_token = self.criterion(
+                logits.reshape(-1, self.model.num_actions),
+                actions.reshape(-1)
+            ).reshape(B, L)
+            
+            loss = (loss_per_token * mask).sum() / mask.sum()
+            
+            pred_actions = logits.argmax(dim=-1)
+            accuracy = ((pred_actions == actions) * mask).sum() / mask.sum()
+            
+            metrics_sum['loss'] += loss.item()
+            metrics_sum['accuracy'] += accuracy.item()
+        
+        return {k: v / len(self.val_loader) for k, v in metrics_sum.items()}
+    
+    def train(self, num_epochs):
+        """Full training loop"""
+        best_val_loss = float('inf')
+        
+        for epoch in range(num_epochs):
+            # Train
+            train_metrics = self.train_epoch(epoch)
+            
+            # Validate
+            val_metrics = self.evaluate()
+            
+            # Log
+            print(f"Epoch {epoch}:")
+            print(f"  Train: {train_metrics}")
+            print(f"  Val: {val_metrics}")
+            
+            wandb.log({
+                'epoch': epoch,
+                **{f'train/{k}': v for k, v in train_metrics.items()},
+                **{f'val/{k}': v for k, v in val_metrics.items()},
+            })
+            
+            # Save best model
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                torch.save(
+                    self.model.state_dict(),
+                    f"checkpoints/best_model_epoch{epoch}.pt"
+                )
+```
+
+**Week 2 Deliverables**:
+- ✅ Working diffusion policy (1-2M params)
+- ✅ Training converges on Empty-8x8 (>90% accuracy)
+- ✅ Baseline evaluation metrics
+- ✅ Saved model checkpoints
+
+---
+
+### Phase 3: MCTD Search in Hidden Space (Week 3) - **M1 MacBook**
+
+**Goal**: Implement tree search over hidden action sequences.
+
+**Search Parameters** (small for local testing):
+- Num simulations: 20-50
+- Tree depth: 5-10 levels
+- Branching factor: 3 (different guidance scales)
+
+**Tasks**:
+1. ✅ MCTS tree structure
+2. ✅ UCT selection
+3. ✅ Fast rollout (jumpy denoising)
+4. ✅ Reward from maze completion
+5. ✅ Compare vs direct policy
+
+#### Key Implementation: MCTD Node
+
+```python
+# src/mctd/node.py
+import torch
+import numpy as np
+
+class MCTDNode:
+    """
+    Node in MCTD tree representing a partially denoised action sequence.
+    
+    Stores:
+    - hidden_state: [seq_len, hidden_dim] continuous action representation
+    - noise_level: float in [0, 1], how noisy the actions are
+    - env_state: dict, the maze state at this point
+    - statistics: visits, total reward, Q-value
+    """
+    def __init__(
+        self,
+        hidden_state,
+        noise_level,
+        env_state,
+        parent=None,
+        action_taken=None,
+    ):
+        self.hidden_state = hidden_state  # [L, D]
+        self.noise_level = noise_level    # float
+        self.env_state = env_state        # dict
+        self.parent = parent
+        self.action_taken = action_taken  # int or None
+        
+        # Tree statistics
+        self.children = []
+        self.visits = 0
+        self.total_reward = 0.0
+        self.q_value = 0.0
+        
+        # For analysis
+        self.depth = 0 if parent is None else parent.depth + 1
+    
+    def is_leaf(self):
+        """Check if this is a leaf node"""
+        return len(self.children) == 0
+    
+    def is_terminal(self):
+        """Check if we've reached final denoising (t=0)"""
+        return self.noise_level <= 0.01
+    
+    def add_child(self, child):
+        """Add a child node"""
+        self.children.append(child)
+    
+    def update(self, reward):
+        """Update statistics after rollout"""
+        self.visits += 1
+        self.total_reward += reward
+        self.q_value = self.total_reward / self.visits
+    
+    def uct_score(self, exploration_const=1.414):
+        """
+        Upper Confidence Bound for Trees (UCT).
+        
+        UCT = Q(s,a) + c * sqrt(ln(N(s)) / N(s,a))
+        
+        where:
+        - Q(s,a) is average reward from this node
+        - N(s) is parent visits
+        - N(s,a) is this node's visits
+        - c is exploration constant
+        """
+        if self.visits == 0:
+            return float('inf')  # Prioritize unvisited nodes
+        
+        if self.parent is None:
+            return self.q_value
+        
+        exploitation = self.q_value
+        exploration = exploration_const * np.sqrt(
+            np.log(self.parent.visits) / self.visits
+        )
+        
+        return exploitation + exploration
+    
+    def best_child(self, exploration_const=1.414):
+        """Select child with highest UCT score"""
+        if not self.children:
+            return None
+        
+        return max(self.children, key=lambda c: c.uct_score(exploration_const))
+    
+    def __repr__(self):
+        return (f"MCTDNode(depth={self.depth}, t={self.noise_level:.2f}, "
+                f"visits={self.visits}, Q={self.q_value:.3f})")
+```
+
+#### Key Implementation: MCTD Search
+
+```python
+# src/mctd/search.py
+import torch
+import torch.nn as nn
+from .node import MCTDNode
+
+class HiddenSpaceMCTD:
+    """
+    Monte Carlo Tree Diffusion in continuous hidden space.
+    
+    Key innovation: Search over hidden action representations,
+    decode to discrete actions only when evaluating reward.
+    """
+    def __init__(
+        self,
+        policy_model,
+        env,
+        num_simulations=50,
+        exploration_const=1.414,
+        guidance_scales=[0.0, 0.5, 1.0],
+        sparse_timesteps=[1.0, 0.5, 0.2, 0.0],
+        device='mps',
+    ):
+        self.model = policy_model.to(device)
+        self.model.eval()
+        
+        self.env = env
+        self.num_simulations = num_simulations
+        self.exploration_const = exploration_const
+        self.guidance_scales = guidance_scales
+        self.sparse_timesteps = sparse_timesteps
+        self.device = device
+    
+    @torch.no_grad()
+    def search(self, initial_state):
+        """
+        Run MCTD search from initial state.
+        
+        Returns:
+            best_actions: [seq_len] discrete action sequence
+            search_tree: root node (for analysis)
+        """
+        # Initialize root with noisy hidden state
+        seq_len = self.model.max_seq_len
+        h_init = torch.randn(
+            seq_len, 
+            self.model.hidden_dim,
+            device=self.device
+        )
+        
+        root = MCTDNode(
+            hidden_state=h_init,
+            noise_level=1.0,
+            env_state=initial_state,
+        )
+        
+        # Run simulations
+        for sim in range(self.num_simulations):
+            # 1. Selection
+            node = self.select(root)
+            
+            # 2. Expansion
+            if not node.is_terminal():
+                children = self.expand(node)
+                
+                # 3. Simulation on each child
+                for child in children:
+                    reward = self.simulate(child)
+                    
+                    # 4. Backpropagation
+                    self.backpropagate(child, reward)
+        
+        # Extract best trajectory
+        best_actions = self.extract_best_trajectory(root)
+        
+        return best_actions, root
+    
+    def select(self, root):
+        """
+        Selection phase: Navigate tree using UCT.
+        
+        Keep selecting best child until reaching a leaf node.
+        """
+        node = root
+        
+        while not node.is_leaf() and not node.is_terminal():
+            node = node.best_child(self.exploration_const)
+        
+        return node
+    
+    def expand(self, node):
+        """
+        Expansion phase: Create children via different denoising strategies.
+        
+        Meta-actions = different guidance scales.
+        Each child represents a different refinement of the action plan.
+        """
+        children = []
+        
+        for guidance_scale in self.guidance_scales:
+            # Denoise one step with this guidance
+            h_next = self.model.denoise_step(
+                node.hidden_state[None, ...],  # Add batch dim
+                {k: v[None, ...] for k, v in node.env_state.items()},
+                torch.tensor([node.noise_level], device=self.device),
+                guidance_scale=guidance_scale
+            )[0]  # Remove batch dim
+            
+            # Create child node
+            child = MCTDNode(
+                hidden_state=h_next,
+                noise_level=max(0.0, node.noise_level - 0.2),  # Step down
+                env_state=node.env_state,
+                parent=node,
+                action_taken=guidance_scale,
+            )
+            
+            node.add_child(child)
+            children.append(child)
+        
+        return children
+    
+    def simulate(self, node):
+        """
+        Simulation phase: Fast rollout to t=0 using jumpy denoising.
+        
+        Instead of full denoising schedule, jump to sparse timesteps.
+        This is the key efficiency trick from Fast-MCTD.
+        """
+        h = node.hidden_state.clone()
+        state = node.env_state
+        t = node.noise_level
+        
+        # Jumpy denoising: skip to sparse timesteps
+        remaining_steps = [ts for ts in self.sparse_timesteps if ts < t]
+        
+        for t_target in remaining_steps:
+            h = self.model.denoise_step(
+                h[None, ...],
+                {k: v[None, ...] if isinstance(v, torch.Tensor) else v 
+                 for k, v in state.items()},
+                torch.tensor([t_target], device=self.device),
+                guidance_scale=1.0  # Default guidance
+            )[0]
+        
+        # Decode to discrete actions
+        logits = self.model.action_head(h)  # [L, num_actions]
+        actions = logits.argmax(dim=-1)  # [L]
+        
+        # Evaluate in environment
+        reward = self.evaluate_trajectory(actions, state)
+        
+        return reward
+    
+    def evaluate_trajectory(self, actions, initial_state):
+        """
+        Execute action sequence in environment and return reward.
+        
+        Reward components:
+        - success: +10 if reached goal
+        - efficiency: -0.1 per step
+        - validity: -1 per invalid action
+        """
+        # Reset environment to initial state
+        self.env.reset()
+        # TODO: Set environment to initial_state (may need env modification)
+        
+        total_reward = 0.0
+        steps = 0
+        max_steps = len(actions)
+        
+        for action in actions:
+            # Execute action
+            obs, reward, done, info = self.env.step(action.item())
+            
+            total_reward += reward
+            steps += 1
+            
+            if done:
+                if reward > 0:  # Success
+                    total_reward += 10.0
+                break
+        
+        # Efficiency penalty
+        total_reward -= 0.1 * steps
+        
+        return total_reward
+    
+    def backpropagate(self, node, reward):
+        """
+        Backpropagation phase: Update statistics up the tree.
+        """
+        current = node
+        
+        while current is not None:
+            current.update(reward)
+            current = current.parent
+    
+    def extract_best_trajectory(self, root):
+        """
+        Extract best action sequence by following highest Q-value path.
+        """
+        node = root
+        
+        # Follow best children to terminal node
+        while not node.is_terminal():
+            if not node.children:
+                break
+            
+            # Select child with highest Q-value (exploit only)
+            node = max(node.children, key=lambda c: c.q_value)
+        
+        # Decode final hidden state
+        logits = self.model.action_head(node.hidden_state)
+        actions = logits.argmax(dim=-1)
+        
+        return actions
+```
+
+**Week 3 Deliverables**:
+- ✅ Working MCTD search (20-50 sims)
+- ✅ Success rate comparison vs baseline
+- ✅ Tree visualization notebook
+- ✅ Analysis of search statistics
+
+---
+
+### Phase 4: Hierarchical Planning (Week 4) - **Cloud GPU Recommended**
+
+**Transition to cloud for larger experiments**
+
+**Model Sizes**:
+- Planner: 2-4M params (coarse waypoints)
+- Executor: 1-2M params (detailed actions)
+
+**Tasks**:
+1. ✅ Train planner model (waypoint-level)
+2. ✅ Train executor model (action-level)
+3. ✅ Hierarchical MCTD integration
+4. ✅ Speedup measurements
+
+#### Implementation Sketch
+
+```python
+# src/models/hierarchical/planner.py
+class WaypointPlanner(nn.Module):
+    """
+    Coarse planner that generates sparse waypoints.
+    
+    Operates at higher abstraction: room transitions, door openings.
+    """
+    def __init__(self, hidden_dim=128, max_waypoints=8):
+        super().__init__()
+        self.max_waypoints = max_waypoints
+        # Similar to DiffusionPolicy but shorter sequences
+        
+class HierarchicalMCTD:
+    def search(self, initial_state):
+        # 1. Search at waypoint level (much faster)
+        waypoints = mctd_search(
+            self.planner,
+            initial_state,
+            num_simulations=20,  # Fewer needed
+            max_seq_len=8
+        )
+        
+        # 2. Execute between waypoints (deterministic)
+        actions = []
+        for i in range(len(waypoints) - 1):
+            segment = self.executor.generate(
+                start=waypoints[i],
+                goal=waypoints[i+1]
+            )
+            actions.extend(segment)
+        
+        return actions
+```
+
+---
+
+### Phase 5: Adversarial Masking (Week 5) - **Cloud GPU**
+
+**Goal**: Use tree statistics to guide adversarial training.
+
+**Tasks**:
+1. ✅ Collect visit counts during search
+2. ✅ Identify high-importance positions
+3. ✅ Train with adversarial masks
+4. ✅ Evaluate robustness
+
+#### Implementation Sketch
+
+```python
+# src/training/adversarial_trainer.py
+class AdversarialMCTDTrainer:
+    def collect_importance_map(self, batch):
+        """Run MCTD, track which positions matter"""
+        importance = []
+        
+        for state in batch:
+            tree = self.mctd.search(state)
+            
+            # High visit counts = important decision points
+            visit_map = self.compute_visit_importance(tree)
+            importance.append(visit_map)
+        
+        return torch.stack(importance)
+    
+    def train_step_adversarial(self, batch):
+        # Get importance from tree search
+        importance = self.collect_importance_map(batch)
+        
+        # Mask high-importance positions preferentially
+        mask_prob = importance / importance.max()
+        mask = torch.bernoulli(mask_prob * 0.5)  # 50% of important
+        
+        # Standard training with adversarial mask
+        loss = self.mdlm_loss(batch, mask=mask)
+        return loss
+```
+
+---
+
+### Phase 6: Parallel Optimization (Week 6) - **Cloud GPU**
+
+**Goal**: Achieve 10-50x speedup via parallelization.
+
+**Tasks**:
+1. ✅ Batch parallel rollouts
+2. ✅ Delayed tree updates
+3. ✅ Redundancy-aware selection
+4. ✅ Comprehensive benchmarks
+
+#### Implementation Sketch
+
+```python
+# src/mctd/parallel/parallel_mctd.py
+class ParallelMCTD:
+    def search_parallel(self, initial_state, batch_size=16):
+        root = MCTDNode(...)
+        
+        while total_sims < num_simulations:
+            # RAS: select batch without redundancy
+            nodes = self.redundancy_aware_select(root, k=batch_size)
+            
+            # Parallel expand + simulate
+            batch_children = [self.expand(n) for n in nodes]
+            all_children = flatten(batch_children)
+            
+            # GPU batch operations
+            batch_h = torch.stack([c.hidden_state for c in all_children])
+            batch_denoised = self.batch_jumpy_denoise(batch_h)
+            batch_rewards = self.batch_evaluate(batch_denoised)
+            
+            # Delayed update after full batch
+            for child, r in zip(all_children, batch_rewards):
+                self.backpropagate(child, r)
+        
+        return self.extract_best_trajectory(root)
+```
+
+---
+
+## Experimental Protocol
+
+### Environments (Progressive Difficulty)
+
+```python
+ENVIRONMENTS = [
+    # Phase 1-2: Local development
+    {
+        'name': 'MiniGrid-Empty-8x8-v0',
+        'difficulty': 'easy',
+        'expected_success': 100,
+        'purpose': 'Validate basic training'
+    },
+    
+    # Phase 3: Test search
+    {
+        'name': 'MiniGrid-FourRooms-v0',
+        'difficulty': 'medium',
+        'expected_success': 90,
+        'purpose': 'Test branch point handling'
+    },
+    
+    # Phase 4-5: Cloud GPU
+    {
+        'name': 'MiniGrid-DoorKey-8x8-v0',
+        'difficulty': 'hard',
+        'expected_success': 80,
+        'purpose': 'Long-horizon reasoning'
+    },
+    
+    # Phase 6: Final benchmark
+    {
+        'name': 'MiniGrid-MultiRoom-N6-v0',
+        'difficulty': 'very hard',
+        'expected_success': 70,
+        'purpose': 'Stress test all techniques'
+    },
+]
+```
+
+### Metrics
+
+```python
+METRICS = {
+    # Success
+    'success_rate': 'Percent reaching goal',
+    'avg_path_length': 'Mean steps to goal',
+    'optimal_gap': 'Ratio to shortest path',
+    
+    # Efficiency
+    'search_time': 'Wall-clock seconds',
+    'tree_size': 'Nodes explored',
+    'sims_per_second': 'Throughput',
+    
+    # Quality
+    'value_accuracy': 'Q-value correlation',
+    'hidden_state_diversity': 'Entropy of hidden states',
+    
+    # Hierarchical (Phase 4+)
+    'planner_speedup': 'Time saved vs flat search',
+    'waypoint_accuracy': 'Waypoints reached',
+}
+```
+
+### Ablation Studies
+
+```python
+ABLATIONS = {
+    'baselines': [
+        'direct_policy',      # No search
+        'a_star',             # Optimal
+        'random_search',      # Control
+    ],
+    
+    'mctd_variants': [
+        'vanilla_mctd',
+        '+ hierarchical',
+        '+ adversarial_masking',
+        '+ parallel_optimization',
+    ],
+    
+    'hyperparameters': {
+        'num_simulations': [10, 20, 50, 100, 200],
+        'guidance_scales': [[0.0, 1.0], [0.0, 0.5, 1.0], [0.0, 0.25, 0.5, 0.75, 1.0]],
+        'batch_size': [4, 8, 16, 32],  # For parallel MCTD
+    }
+}
+```
+
+---
+
+## Key Research Questions
+
+### Phase 1-2: Foundation
+- ✅ Can we train diffusion models on maze trajectories?
+- ✅ What's baseline success rate without search?
+
+### Phase 3: Core MCTD
+- 🔬 Does hidden-space search improve over direct policy?
+- 🔬 How does search time scale with maze complexity?
+- 🔬 What guidance scales work best?
+
+### Phase 4: Hierarchical
+- 🔬 Does coarse planning speed up search?
+- 🔬 What's the quality vs speed tradeoff?
+- 🔬 Can we identify waypoints automatically?
+
+### Phase 5: Adversarial
+- 🔬 Do tree statistics identify critical decisions?
+- 🔬 Does adversarial masking improve robustness?
+- 🔬 Can models generalize to harder mazes?
+
+### Phase 6: Parallel
+- 🔬 How much speedup from parallelization?
+- 🔬 What are the bottlenecks?
+- 🔬 Does quality degrade with larger batches?
+
+---
+
+## Development Tips for Agentic Coding Assistant
+
+### M1 MacBook Considerations
+
+```python
+# Always use MPS device for GPU acceleration
+device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+# Keep models small during local development
+SMALL_MODEL_CONFIG = {
+    'hidden_dim': 128,
+    'num_layers': 4,
+    'num_heads': 4,
+    'batch_size': 16,  # Small batches for memory
+}
+
+# Use num_workers=0 for DataLoader (M1 multiprocessing issues)
+train_loader = DataLoader(
+    dataset,
+    batch_size=16,
+    num_workers=0,  # Single-threaded
+    pin_memory=False,  # Not needed for MPS
+)
+
+# Gradient checkpointing for memory efficiency
+def forward_with_checkpointing(self, x):
+    return torch.utils.checkpoint.checkpoint(
+        self._forward_impl, x, use_reentrant=False
+    )
+```
+
+### Cloud GPU Transition Checklist
+
+```python
+# When moving to cloud, update:
+CLOUD_MODEL_CONFIG = {
+    'hidden_dim': 256,  # 2x larger
+    'num_layers': 8,    # Deeper
+    'num_heads': 8,
+    'batch_size': 64,   # Larger batches
+}
+
+# Use DataParallel for multi-GPU
+model = nn.DataParallel(model)
+
+# Enable mixed precision training
+from torch.cuda.amp import autocast, GradScaler
+scaler = GradScaler()
+
+# Use multiple workers
+train_loader = DataLoader(
+    dataset,
+    batch_size=64,
+    num_workers=8,  # Parallel data loading
+    pin_memory=True,
+)
+```
+
+### Testing Strategy
+
+```python
+# Write tests for each component
+# tests/test_mctd.py
+
+def test_node_creation():
+    """Test MCTDNode initialization"""
+    h = torch.randn(10, 128)
+    node = MCTDNode(h, noise_level=0.5, env_state={})
+    assert node.visits == 0
+    assert node.q_value == 0.0
+
+def test_uct_selection():
+    """Test UCT scoring and selection"""
+    root = MCTDNode(...)
+    # Add children and update stats
+    # Verify best child selection
+
+def test_search_completes():
+    """Test full MCTD search runs without error"""
+    mctd = HiddenSpaceMCTD(model, env, num_simulations=5)
+    actions, tree = mctd.search(initial_state)
+    assert len(actions) > 0
+    assert tree.visits > 0
+```
+
+### Debugging Tips
+
+```python
+# Add verbose logging
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+# Visualize tree during search
+def visualize_tree(root, save_path='tree.png'):
+    """Create graphviz visualization of MCTD tree"""
+    import graphviz
+    dot = graphviz.Digraph()
+    
+    def add_nodes(node, parent_id=None):
+        node_id = str(id(node))
+        label = f"t={node.noise_level:.2f}\nQ={node.q_value:.3f}\nN={node.visits}"
+        dot.node(node_id, label)
+        
+        if parent_id:
+            dot.edge(parent_id, node_id)
+        
+        for child in node.children:
+            add_nodes(child, node_id)
+    
+    add_nodes(root)
+    dot.render(save_path)
+
+# Profile performance
+import cProfile
+cProfile.run('mctd.search(state)', 'profile_stats')
+
+# Memory profiling
+import tracemalloc
+tracemalloc.start()
+# ... run code ...
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+```
+
+---
+
+## Timeline Summary
+
+| Week | Phase | Environment | Focus |
+|------|-------|------------|-------|
+| 1 | Foundation | M1 MacBook | MiniGrid setup, expert data |
+| 2 | Baseline | M1 MacBook | Diffusion policy training |
+| 3 | Core MCTD | M1 MacBook | Tree search implementation |
+| 4 | Hierarchical | Cloud GPU | Planner/executor separation |
+| 5 | Adversarial | Cloud GPU | Tree-guided masking |
+| 6 | Parallel | Cloud GPU | Speedup optimizations |
+
+**Total**: 6 weeks to full implementation
+
+**Milestones**:
+- End of Week 2: Working baseline diffusion policy
+- End of Week 3: Proof-of-concept MCTD search
+- End of Week 4: Hierarchical speedups demonstrated
+- End of Week 6: Publication-ready results
+
+---
+
+## Expected Results
+
+Based on similar work (Fast-MCTD paper):
+
+| Method | Empty-8x8 | FourRooms | DoorKey | MultiRoom-N6 |
+|--------|-----------|-----------|---------|--------------|
+| Direct Policy | 95% | 70% | 40% | 20% |
+| Vanilla MCTD | 100% | 85% | 65% | 45% |
+| + Hierarchical | 100% | 90% | 75% | 60% |
+| + Adversarial | 100% | 92% | 80% | 70% |
+| + Parallel | 100% | 92% | 80% | 70% |
+
+**Speedups** (vs vanilla MCTD):
+- Hierarchical: 3-5x
+- Parallel (K=16): 10-20x
+- Combined: 20-50x
+
+---
+
+## Transfer to Language Models
+
+Once validated on mazes, the techniques transfer directly:
+
+```python
+# Maze Navigation → Language Reasoning
+
+# 1. Hidden space search
+maze_hidden = [seq_len, hidden_dim]  # Action sequences
+language_hidden = [seq_len, d_model]  # Token sequences
+
+# 2. Branch points
+maze_branches = doorways, intersections
+language_branches = reasoning steps, logical forks
+
+# 3. Hierarchical planning
+maze_planner = waypoints (rooms)
+language_planner = reasoning outline (claims)
+
+maze_executor = actions between waypoints
+language_executor = detailed reasoning steps
+
+# 4. Adversarial masking
+maze_masking = high-visit positions
+language_masking = critical reasoning tokens
+
+# 5. Rewards
+maze_reward = goal reached
+language_reward = answer correct (GRPO-style)
+```
+
+The core algorithms are identical—only the domain changes!
+
+---
+
+## Contact & Collaboration
+
+This implementation plan is designed for rapid iteration with agentic coding assistants. Key principles:
+
+1. **Modular**: Each component is self-contained
+2. **Testable**: Every function has clear inputs/outputs
+3. **Incremental**: Each phase builds on previous work
+4. **Transferable**: Maze techniques → Language reasoning
+
+Good luck with implementation! 🚀
