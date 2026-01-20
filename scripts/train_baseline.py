@@ -15,6 +15,7 @@ from src.environments.trajectory_dataset import TrajectoryDataset
 from src.training.mdlm_trainer import MaskedDiffusionTrainer
 from src.utils.logging import Logger
 from src.utils.checkpointing import save_checkpoint
+from src.config import get_experiment_config
 
 
 def load_dataset(data_path, max_seq_len=64):
@@ -27,39 +28,52 @@ def load_dataset(data_path, max_seq_len=64):
 
 def main():
     """Main training function."""
-    # Configuration
-    config = {
-        # Model
-        'num_actions': 7,
-        'hidden_dim': 64,
-        'num_layers': 4,
-        'num_heads': 4,
-        'num_tokens': 49,  # 7x7 grid
-        'max_seq_len': 64,
-        'dropout': 0.1,
-        
-        # Training
-        'batch_size': 16,
-        'learning_rate': 1e-3,
-        'weight_decay': 1e-4,  # Can use 1e-5 if needed
-        'num_epochs': 3,
-        'num_diffusion_steps': 100,
-        'mask_schedule': 'cosine',
-        'lr_patience': 5,
-        
-        # Data
-        'data_dir': 'data',
-        'env_name': 'Empty-8x8',  # or 'FourRooms'
-        
-        # Checkpoints
-        'checkpoint_dir': 'checkpoints',
-        
-        # Logging
-        'use_wandb': False,  # Set to True if wandb installed
-    }
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train baseline masked diffusion policy')
+    parser.add_argument('--pretrained_state_encoder', type=str, default=None,
+                       help='Path to pretrained state encoder checkpoint (from Stage 1 pretraining)')
+    parser.add_argument('--freeze_state_encoder', action='store_true',
+                       help='Freeze state encoder during training (Stage 2: train DiT only)')
+    parser.add_argument('--env', type=str, default=None,
+                       help='Environment name (overrides config default)')
+    parser.add_argument('--hidden_dim', type=int, default=None,
+                       help='Hidden dimension (must match pretrained encoder if loading one)')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device (cpu, cuda, mps, or auto)')
+    
+    args = parser.parse_args()
+    
+    # Load configuration from central config module
+    # This ensures consistency across all scripts
+    experiment_config = get_experiment_config()
+    
+    # Convert to dict format for compatibility with existing code
+    config = experiment_config.to_dict()
+    
+    # Override with command-line arguments
+    if args.pretrained_state_encoder:
+        config['pretrained_state_encoder_path'] = args.pretrained_state_encoder
+    if args.freeze_state_encoder:
+        config['freeze_state_encoder'] = True
+    if args.env:
+        config['env_name'] = args.env
+    if args.hidden_dim is not None:
+        config['hidden_dim'] = args.hidden_dim
+        # Also update the model config object
+        experiment_config.model.hidden_dim = args.hidden_dim
+    
+    # Override environment name if needed (can be set via config or kept as default)
+    # config['env_name'] = 'FourRooms'  # Uncomment to change environment
     
     # Device
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    if args.device:
+        if args.device == 'auto':
+            device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = args.device
+    else:
+        device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     print(f"Using device: {device}")
     
     # Load datasets
@@ -107,11 +121,81 @@ def main():
         dropout=config['dropout'],
     )
     
+    # Load pretrained state encoder if specified
+    pretrained_state_encoder_path = config.get('pretrained_state_encoder_path')
+    if pretrained_state_encoder_path:
+        pretrained_path = Path(pretrained_state_encoder_path)
+        if not pretrained_path.exists():
+            print(f"\n⚠️  Warning: Pretrained state encoder path '{pretrained_state_encoder_path}' not found!")
+            print("  Continuing without pretrained encoder (training from scratch)...")
+        else:
+            print(f"\n{'='*60}")
+            print(f"Loading pretrained state encoder from {pretrained_state_encoder_path}")
+            print(f"{'='*60}")
+            checkpoint = torch.load(pretrained_state_encoder_path, map_location=device)
+            
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                checkpoint_config = checkpoint.get('config', {})
+            else:
+                state_dict = checkpoint
+                checkpoint_config = {}
+            
+            # Check for hidden_dim mismatch
+            if checkpoint_config:
+                pretrained_hidden_dim = checkpoint_config.get('hidden_dim')
+                current_hidden_dim = config.get('hidden_dim')
+                if pretrained_hidden_dim and pretrained_hidden_dim != current_hidden_dim:
+                    print(f"\n⚠️  WARNING: Hidden dimension mismatch!")
+                    print(f"  Pretrained encoder: hidden_dim={pretrained_hidden_dim}")
+                    print(f"  Current model: hidden_dim={current_hidden_dim}")
+                    print(f"  This will cause loading errors!")
+                    print(f"\n  Solution: Set --hidden_dim {pretrained_hidden_dim} or update config")
+                    raise ValueError(
+                        f"Hidden dimension mismatch: pretrained={pretrained_hidden_dim}, "
+                        f"current={current_hidden_dim}. Update config or use matching hidden_dim."
+                    )
+            
+            # Load state encoder weights (may have decoder/auxiliary heads we don't need)
+            # Filter to only load encoder weights
+            encoder_state_dict = {}
+            for k, v in state_dict.items():
+                # Skip decoder and auxiliary heads
+                if 'decoder' not in k and 'agent_pos_head' not in k and 'goal_pos_head' not in k and 'direction_head' not in k:
+                    encoder_state_dict[k] = v
+            
+            # Load into model's state encoder
+            model.state_encoder.load_state_dict(encoder_state_dict, strict=False)
+            print("✓ Pretrained state encoder loaded (decoder/auxiliary heads ignored)")
+            
+            # Optionally freeze state encoder for Stage 2 training
+            if config.get('freeze_state_encoder', False):
+                print("\nFreezing state encoder for Stage 2 training (DiT + action encoder only)...")
+                for param in model.state_encoder.parameters():
+                    param.requires_grad = False
+                print("✓ State encoder frozen")
+                print("  Note: Only DiT blocks and action encoder will be trained")
+            else:
+                print("\nState encoder is trainable (will fine-tune end-to-end)")
+    else:
+        print("\n" + "="*60)
+        print("Training from scratch (no pretrained state encoder)")
+        print("="*60)
+        print("  To use pretrained state encoder:")
+        print("    python scripts/train_baseline.py --pretrained_state_encoder <path>")
+        print("  To freeze state encoder (Stage 2):")
+        print("    python scripts/train_baseline.py --pretrained_state_encoder <path> --freeze_state_encoder")
+    
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    frozen_params = total_params - trainable_params
+    
+    print(f"\nModel Parameters:")
+    print(f"  Total: {total_params:,}")
+    print(f"  Trainable: {trainable_params:,}")
+    if frozen_params > 0:
+        print(f"  Frozen: {frozen_params:,} (state encoder)")
     
     # Trainer
     print("\nInitializing trainer...")
@@ -127,6 +211,9 @@ def main():
     checkpoint_dir = Path(config['checkpoint_dir'])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     trainer.checkpoint_dir = checkpoint_dir
+    
+    # Store experiment config in trainer for checkpoint saving
+    trainer.experiment_config = experiment_config
     
     # Logger
     logger = None

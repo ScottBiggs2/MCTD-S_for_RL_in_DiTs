@@ -117,6 +117,42 @@ I agree with the recommendation. Cosine scheduling seems like the correct schedu
 
 ---
 
+## Phase 3: MCTD Search Decisions
+
+### MCTD Training/Reward Integration
+**Question**: How does MCTD search integrate with model training? Which trajectory from the search tree should we use for training?
+
+**Current Assumption**: Use the expected best path (highest Q-value trajectory) from the search tree.
+
+**Context**: 
+- MCTD search builds a tree of possible action sequences
+- Each trajectory has a Q-value (expected reward)
+- For training, we need to select which trajectory(s) to use
+
+**Options**:
+- [X] Best path only (highest Q-value trajectory) - **Current assumption**
+- [ ] Top-K trajectories (weighted by Q-value or visitation count)
+- [ ] All trajectories (weighted by visitation probability)
+- [ ] Soft selection (sample according to visit distribution)
+- [ ] Off-policy learning (use all rollouts regardless of best path)
+
+**Considerations**:
+- **Best path only**: Simple, focuses on exploiting good solutions
+- **Top-K**: More diverse training data, still focused on high-quality paths
+- **All trajectories**: Maximum data usage, includes exploration
+- **Soft selection**: Matches tree search behavior more closely
+- **Off-policy**: Learn from all search experience, not just best decisions
+
+**Future Exploration**:
+- RL-style training (use tree statistics as targets)
+- GRPO-style updates (reward-weighted policy optimization)
+- Adversarial training (use tree visit patterns to guide masking)
+- Imitation learning from search (learn to predict search decisions)
+
+**Recommendation**: Start with best path only (simplest baseline), experiment with alternatives once core MCTD is working.
+
+---
+
 ## Additional Research Questions (To Defer)
 
 ### BFS Optimization

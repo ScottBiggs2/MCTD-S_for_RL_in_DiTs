@@ -79,32 +79,59 @@ class StateEncoder(nn.Module):
         # Case 2: Flattened grid [B, 147] - reshape to [B, 7, 7, 3]
         # Case 3: Already shaped [B, 7, 7, 3] or [B, 3, 7, 7]
         
+        # Detect grid size dynamically from input shape
         if grid.dim() == 3:
-            # [B, seq_len, 147] - take first state for initial condition
+            # [B, seq_len, H*W*3] - take first state for initial condition
             B, seq_len, flat_size = grid.shape
-            if flat_size == self.grid_size * self.grid_size * 3:
-                # Take only first state (initial condition for diffusion)
-                # Make contiguous before reshape
-                grid = grid[:, 0, :].contiguous()  # [B, 147]
-                # Reshape to spatial format: [B, 147] -> [B, 7, 7, 3]
-                grid = grid.reshape(B, self.grid_size, self.grid_size, 3)
-                # Take first direction too
-                if direction.dim() == 2:
-                    direction = direction[:, 0]  # [B]
-                elif direction.dim() == 1:
-                    if direction.shape[0] == B * seq_len:
-                        # Reshape to [B, seq_len] then take first
-                        direction = direction.reshape(B, seq_len)[:, 0]
-            else:
-                raise ValueError(f"Unexpected flattened grid size: {flat_size}, expected {self.grid_size * self.grid_size * 3}")
+            # Infer grid size from flattened size: H*W*3 -> sqrt(H*W) = grid_size
+            inferred_size = int((flat_size // 3) ** 0.5)
+            if inferred_size * inferred_size * 3 != flat_size:
+                raise ValueError(
+                    f"Cannot infer grid size from flat_size={flat_size}. "
+                    f"Expected H*W*3 where H=W. Got inferred_size={inferred_size}, "
+                    f"which gives {inferred_size * inferred_size * 3} (expected {flat_size})"
+                )
+            # Use inferred size or fallback to self.grid_size if mismatch
+            actual_grid_size = inferred_size
+            
+            # Take only first state (initial condition for diffusion)
+            # Make contiguous before reshape
+            grid = grid[:, 0, :].contiguous()  # [B, H*W*3]
+            # Reshape to spatial format: [B, H*W*3] -> [B, H, W, 3]
+            grid = grid.reshape(B, actual_grid_size, actual_grid_size, 3)
+            
+            # Update self.grid_size if different (for CNN tokenizer compatibility)
+            if actual_grid_size != self.grid_size:
+                # Warn but allow it (for now) - we'll update CNN tokenizer to handle this
+                # TODO: Make CNN tokenizer handle variable grid sizes
+                pass
+            
+            # Take first direction too
+            if direction.dim() == 2:
+                direction = direction[:, 0]  # [B]
+            elif direction.dim() == 1:
+                if direction.shape[0] == B * seq_len:
+                    # Reshape to [B, seq_len] then take first
+                    direction = direction.reshape(B, seq_len)[:, 0]
         elif grid.dim() == 2:
-            # [B, 147] - single flattened state
+            # [B, H*W*3] - single flattened state
             B, flat_size = grid.shape
-            if flat_size == self.grid_size * self.grid_size * 3:
-                # Make contiguous before reshape
-                grid = grid.contiguous().reshape(B, self.grid_size, self.grid_size, 3)
-            else:
-                raise ValueError(f"Unexpected flattened grid size: {flat_size}, expected {self.grid_size * self.grid_size * 3}")
+            # Infer grid size from flattened size
+            inferred_size = int((flat_size // 3) ** 0.5)
+            if inferred_size * inferred_size * 3 != flat_size:
+                raise ValueError(
+                    f"Cannot infer grid size from flat_size={flat_size}. "
+                    f"Expected H*W*3 where H=W. Got inferred_size={inferred_size}, "
+                    f"which gives {inferred_size * inferred_size * 3} (expected {flat_size})"
+                )
+            actual_grid_size = inferred_size
+            
+            # Make contiguous before reshape
+            grid = grid.contiguous().reshape(B, actual_grid_size, actual_grid_size, 3)
+            
+            # Update self.grid_size if different
+            if actual_grid_size != self.grid_size:
+                pass  # TODO: Update CNN tokenizer to handle variable sizes
         elif grid.dim() == 4:
             # Already in spatial format: [B, H, W, C] or [B, C, H, W]
             if grid.shape[1] == 3 or grid.shape[-1] == 3:

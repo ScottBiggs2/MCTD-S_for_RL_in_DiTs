@@ -17,21 +17,124 @@ except ImportError:
     )
 
 
+def get_full_grid_image(env) -> np.ndarray:
+    """
+    Render full grid as RGB image (same format as obs['image']).
+    
+    Uses MiniGrid's grid rendering to create a full-board observation.
+    This allows the model to see the entire maze, not just a partial view.
+    
+    Args:
+        env: Gymnasium MiniGrid environment (can be wrapped)
+        
+    Returns:
+        full_image: (H, W, 3) numpy array with full grid observation
+                    Same format as obs['image'] but covering entire grid
+    """
+    unwrapped = env.unwrapped
+    
+    # Get grid dimensions
+    grid = unwrapped.grid
+    width = grid.width
+    height = grid.height
+    
+    # Initialize image array (H, W, 3)
+    # Channel 0: object type
+    # Channel 1: object color  
+    # Channel 2: object state
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Get agent position and direction for rendering
+    agent_pos = unwrapped.agent_pos
+    agent_dir = unwrapped.agent_dir
+    
+    # Use MiniGrid's object type constants for correct encoding
+    # Import here to avoid issues if minigrid not available
+    try:
+        from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX, STATE_TO_IDX
+    except ImportError:
+        # Fallback if constants not available
+        OBJECT_TO_IDX = {'empty': 1, 'wall': 2, 'door': 4, 'key': 5, 'ball': 6, 'goal': 8}
+        COLOR_TO_IDX = {'red': 0, 'green': 1, 'blue': 2, 'purple': 3, 'yellow': 4, 'grey': 5}
+        STATE_TO_IDX = {}
+    
+    # Render each cell in the grid
+    for i in range(height):
+        for j in range(width):
+            cell = grid.get(j, i)  # Note: grid.get(x, y) uses (x, y) = (j, i)
+            
+            # Start with empty encoding
+            obj_type_idx = OBJECT_TO_IDX.get('empty', 1)
+            color_idx = 0
+            state_idx = 0
+            
+            if cell is not None and hasattr(cell, 'type'):
+                # Get object type encoding
+                obj_type = cell.type
+                if obj_type in OBJECT_TO_IDX:
+                    obj_type_idx = OBJECT_TO_IDX[obj_type]
+                elif isinstance(obj_type, int):
+                    obj_type_idx = obj_type  # Already an integer
+                
+                # Get color encoding
+                if hasattr(cell, 'color') and cell.color in COLOR_TO_IDX:
+                    color_idx = COLOR_TO_IDX[cell.color]
+                
+                # Get state encoding (for doors: open/closed)
+                if hasattr(cell, 'is_open'):
+                    if cell.is_open:
+                        state_idx = STATE_TO_IDX.get('open', 1)
+                    else:
+                        state_idx = STATE_TO_IDX.get('closed', 0)
+                elif hasattr(cell, 'state'):
+                    if cell.state in STATE_TO_IDX:
+                        state_idx = STATE_TO_IDX[cell.state]
+                    elif isinstance(cell.state, int):
+                        state_idx = cell.state  # Already an integer
+            
+            # Store in image array
+            image[i, j, 0] = obj_type_idx
+            image[i, j, 1] = color_idx
+            image[i, j, 2] = state_idx
+            
+            # Mark agent position (override cell if agent is here)
+            if agent_pos is not None and i == agent_pos[1] and j == agent_pos[0]:
+                # Agent encoding: use OBJECT_TO_IDX.get('agent', ...) or special value
+                # MiniGrid uses agent direction encoded in object type
+                # For now, use a special value for agent (will need to match MiniGrid's encoding)
+                # In partial obs, agent is encoded as direction value in channel 0
+                # But in full grid, we may need to use a different approach
+                # Let's use the agent direction + object type combination
+                # For compatibility, use the same encoding as partial obs when agent is present
+                image[i, j, 0] = 10  # Agent marker (will need refinement)
+                image[i, j, 2] = agent_dir  # Store direction in state channel
+    
+    # Convert to float32 and normalize (matching obs['image'] format)
+    # MiniGrid observations use uint8, but we'll keep as uint8 for consistency
+    return image.astype(np.uint8)
+
+
 class MazeEnvironment:
     """
     Wrapper for MiniGrid environments.
     Provides state embeddings and branch point detection.
     
-    Note: This is a basic implementation. State representation choices
-    may need refinement based on research decisions.
+    Supports both partial (7x7) and full grid observations.
+    Full grid observations allow the model to see the entire maze.
     """
-    def __init__(self, env_name: str = "MiniGrid-Empty-8x8-v0", max_steps: int = 100):
+    def __init__(
+        self, 
+        env_name: str = "MiniGrid-Empty-8x8-v0", 
+        max_steps: int = 100,
+        use_full_grid: bool = True,
+    ):
         """
         Initialize MiniGrid environment wrapper.
         
         Args:
             env_name: Name of the MiniGrid environment
             max_steps: Maximum steps per episode
+            use_full_grid: If True, use full grid observations; if False, use partial 7x7 view
         """
         # Ensure minigrid is imported to register environments
         import minigrid
@@ -57,6 +160,17 @@ class MazeEnvironment:
         self.action_space = self.env.action_space.n if hasattr(self.env.action_space, 'n') else 7
         self.max_steps = max_steps
         self.env_name = env_name
+        self.use_full_grid = use_full_grid
+        
+        # Get grid dimensions (for full grid mode)
+        if use_full_grid and hasattr(self.env.unwrapped, 'grid'):
+            grid = self.env.unwrapped.grid
+            self.grid_width = grid.width
+            self.grid_height = grid.height
+        else:
+            # Partial view is always 7x7
+            self.grid_width = 7
+            self.grid_height = 7
         
     def reset(self) -> Dict[str, torch.Tensor]:
         """
@@ -93,20 +207,30 @@ class MazeEnvironment:
         """
         Convert MiniGrid observation to state representation.
         
-        obs['image']: (7, 7, 3) partially observable view
-            - Channel 0: object type
-            - Channel 1: object color
-            - Channel 2: object state
-        obs['direction']: agent direction (0-3)
+        If use_full_grid=True, renders full grid board instead of partial view.
+        This allows the model to see the entire maze (goal, walls, doors, etc.).
+        
+        Args:
+            obs: Observation dict from environment
+                - obs['image']: (7, 7, 3) partial view OR (H, W, 3) full grid
+                - obs['direction']: agent direction (0-3)
         
         Returns:
             Dictionary with:
-            - 'grid': flattened grid observation [147] (7*7*3)
+            - 'grid': flattened grid observation [H*W*3]
             - 'direction': facing direction [1]
             - 'position': (x, y) if available, else None
         """
-        # Flatten grid observation: (7, 7, 3) -> (147,)
-        grid_flat = obs['image'].flatten()
+        # Get grid image (full or partial)
+        if self.use_full_grid:
+            # Render full grid from environment
+            grid_image = get_full_grid_image(self.env)
+        else:
+            # Use partial observation from obs['image']
+            grid_image = obs['image']
+        
+        # Flatten grid observation: (H, W, 3) -> (H*W*3,)
+        grid_flat = grid_image.flatten()
         direction = obs['direction']
         
         # Try to get absolute position (available in some envs)

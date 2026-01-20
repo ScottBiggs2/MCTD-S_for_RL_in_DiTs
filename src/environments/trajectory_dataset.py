@@ -60,10 +60,15 @@ class TrajectoryDataset(Dataset):
             actions_tensor = torch.cat([actions_tensor, padding])
         
         # Convert states to batched format
-        # Each state is a dict with 'grid' and 'direction'
+        # IMPORTANT: For masked diffusion, we only condition on the INITIAL state
+        # The model predicts actions from the initial state, not from each state in sequence
+        # So we only return the first state (initial condition)
+        # DataLoader will add batch dimension automatically
+        initial_state = states_padded[0] if states_padded else states[-1] if states else {}
+        
         batch_states = {
-            'grid': torch.stack([torch.tensor(s['grid'], dtype=torch.float32) for s in states_padded]),
-            'direction': torch.stack([torch.tensor(s['direction'], dtype=torch.long) for s in states_padded]),
+            'grid': torch.tensor(initial_state['grid'], dtype=torch.float32),  # [H, W, 3] -> DataLoader batches to [B, H, W, 3]
+            'direction': torch.tensor(initial_state['direction'], dtype=torch.long),  # [] (scalar) -> DataLoader batches to [B]
         }
         
         return {

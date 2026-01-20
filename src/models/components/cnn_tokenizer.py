@@ -95,11 +95,15 @@ class StateCNNTokenizer(nn.Module):
         """
         Tokenize grid observation.
         
+        Supports variable grid sizes (e.g., 7x7, 19x19).
+        
         Args:
-            grid_obs: (batch, grid_size, grid_size, num_channels) or (batch, num_channels, grid_size, grid_size)
+            grid_obs: (batch, H, W, num_channels) or (batch, num_channels, H, W)
+                    H and W can be any size (not just grid_size)
         
         Returns:
             tokens: (batch, num_tokens, hidden_dim)
+                   num_tokens = H*W if num_tokens=None, else uses num_tokens
         """
         # Ensure input is contiguous tensor
         if not isinstance(grid_obs, torch.Tensor):
@@ -109,17 +113,19 @@ class StateCNNTokenizer(nn.Module):
         if grid_obs.dim() == 4:
             # Check if format is (B, H, W, C) or (B, C, H, W)
             B, dim1, dim2, dim3 = grid_obs.shape
-            if dim1 == self.grid_size and dim3 == 3:
-                # (B, H, W, C) format - convert to (B, C, H, W)
+            if dim3 == 3:  # (B, H, W, C) format
+                # Convert to (B, C, H, W)
                 # Make contiguous after permute to avoid view issues
                 grid_obs = grid_obs.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
-            elif dim1 == 3:
-                # Already (B, C, H, W) format - make contiguous just in case
+                H, W = dim1, dim2
+            elif dim1 == 3:  # (B, C, H, W) format
+                # Already correct format - make contiguous just in case
                 grid_obs = grid_obs.contiguous()
+                H, W = dim2, dim3
             else:
                 raise ValueError(
                     f"Unexpected grid format: shape={grid_obs.shape}, "
-                    f"expected (B, {self.grid_size}, {self.grid_size}, 3) or (B, 3, {self.grid_size}, {self.grid_size})"
+                    f"expected (B, H, W, 3) or (B, 3, H, W)"
                 )
         else:
             raise ValueError(f"Expected 4D input, got {grid_obs.dim()}D with shape {grid_obs.shape}")

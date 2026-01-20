@@ -7,10 +7,11 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 
-from .state_encoder import StateEncoder
+from .state_cnn_encoder import StateCNNEncoder
 from .action_encoder import ActionEncoder
 from .components.timestep_embed import SinusoidalPositionEmbedding
 from .components.dit_block import DiTBlock
+from .components.position_embedding import PositionalEmbedding
 
 
 class DiffusionPolicy(nn.Module):
@@ -21,14 +22,19 @@ class DiffusionPolicy(nn.Module):
     denoises to discrete action logits.
     
     Architecture:
-        State -> StateEncoder -> [B, 49, 128] tokens
-        Noisy Actions -> [B, 49, 128] hidden
-        + Timestep embedding
-        + State conditioning
+        State (19x19 grid) -> StateEncoder -> [B, 361, 128] tokens -> POOLED to [B, 128] conditioning
+        Noisy Actions -> [B, 32, 128] hidden (max_seq_len actions, NOT num_tokens!)
+        + Timestep embedding [B, 128]
+        + State conditioning [B, 128]
         ↓
-        DiT Blocks (4 layers)
+        DiT Blocks (num_layers)
         ↓
-        Action Logits [B, 49, 7]
+        Action Logits [B, 32, 7]
+    
+    IMPORTANT: 
+    - num_tokens (361) is for STATE encoding (19x19 grid cells) → pooled to conditioning vector
+    - max_seq_len (32) is for ACTION sequences → these are what we predict
+    - MiniGrid actions: 0=turn_left, 1=turn_right, 2=move_forward, 3=pickup, 4=drop, 5=toggle, 6=done
     """
     def __init__(
         self,
@@ -36,9 +42,10 @@ class DiffusionPolicy(nn.Module):
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
-        num_tokens=49,  # 7x7 grid
+        num_tokens=49,  # Default: 7x7 grid, but can be larger (e.g., 361 for 19x19)
         max_seq_len=64,
         dropout=0.1,
+        grid_size=None,  # If None, inferred from num_tokens (assumes square grid)
     ):
         super().__init__()
         self.num_actions = num_actions
@@ -46,11 +53,21 @@ class DiffusionPolicy(nn.Module):
         self.num_tokens = num_tokens
         self.max_seq_len = max_seq_len
         
-        # Encoders (already handle CNN tokenization)
-        self.state_encoder = StateEncoder(
-            grid_size=7,
+        # Infer grid_size from num_tokens if not provided
+        if grid_size is None:
+            grid_size = int(num_tokens ** 0.5)
+            if grid_size * grid_size != num_tokens:
+                raise ValueError(
+                    f"Cannot infer grid_size from num_tokens={num_tokens}. "
+                    f"Expected num_tokens to be a perfect square, got {num_tokens}"
+                )
+        self.grid_size = grid_size
+        
+        # State encoder: Simple CNN that outputs single embedding vector (CLIP-style)
+        self.state_encoder = StateCNNEncoder(
+            grid_size=grid_size,
             hidden_dim=hidden_dim,
-            num_tokens=num_tokens,
+            num_channels=3,
         )
         
         # Action encoder for converting discrete actions to hidden space
@@ -64,11 +81,16 @@ class DiffusionPolicy(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
         
-        # State conditioning: project state tokens to conditioning vector
-        # StateEncoder outputs [B, 49, 128], we need [B, 128] for conditioning
-        self.state_proj = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),  # [B, 49, 128] -> [B, 1, 128]
-            nn.Flatten(start_dim=1),  # [B, 128]
+        # State conditioning: StateCNNEncoder directly outputs [B, hidden_dim]
+        # No projection needed - encoder already outputs single vector (CLIP-style)
+        
+        # Positional embeddings for action tokens
+        # CRITICAL: Without this, model can't distinguish token positions!
+        # IMPORTANT: Use max_seq_len (not num_tokens) - we predict action sequences, not state tokens!
+        # num_tokens is for state encoding (361 grid cells), but actions are a sequence (32 actions)
+        self.action_pos_embed = PositionalEmbedding(
+            num_tokens=max_seq_len,  # Action sequence length, not state grid size!
+            hidden_dim=hidden_dim
         )
         
         # DiT transformer blocks
@@ -92,24 +114,24 @@ class DiffusionPolicy(nn.Module):
         """
         Denoise action sequence conditioned on state and timestep.
         
+        IMPORTANT: 
+        - State encoding produces num_tokens (361 for 19x19 grid) which are POOLED to conditioning
+        - Action prediction produces max_seq_len (32) actions, NOT num_tokens actions
+        
         Args:
-            noisy_actions: [B, num_tokens, hidden_dim] continuous hidden action states
-            state: dict with 'grid' [B, 7, 7, 3] and 'direction' [B]
+            noisy_actions: [B, max_seq_len, hidden_dim] continuous hidden action states
+            state: dict with 'grid' [B, H, W, 3] (e.g., [B, 19, 19, 3]) and 'direction' [B]
             t: [B] diffusion timestep in [0, 1]
-            mask: [B, num_tokens] binary mask (1 = masked position), optional
+            mask: [B, max_seq_len] binary mask (1 = masked position), optional
         
         Returns:
-            [B, num_tokens, num_actions] denoised action logits
+            [B, max_seq_len, num_actions] denoised action logits
         """
         B = noisy_actions.shape[0]
         
-        # Encode state to tokens
-        state_tokens = self.state_encoder(state)  # [B, num_tokens, hidden_dim]
-        
-        # Project state tokens to conditioning vector
-        state_cond = self.state_proj(state_tokens.transpose(1, 2)).transpose(0, 1)  # [B, hidden_dim]
-        # Alternative: use mean pooling
-        state_cond = state_tokens.mean(dim=1)  # [B, hidden_dim]
+        # Encode state to single embedding vector (CLIP-style conditioning)
+        # StateCNNEncoder directly outputs [B, hidden_dim] - no pooling needed
+        state_cond = self.state_encoder(state)  # [B, hidden_dim]
         
         # Encode timestep
         t_emb = self.time_embed(t)  # [B, hidden_dim]
@@ -118,7 +140,13 @@ class DiffusionPolicy(nn.Module):
         cond_emb = state_cond + t_emb  # [B, hidden_dim]
         
         # Input is already tokenized (noisy_actions are hidden representations)
-        x = noisy_actions  # [B, num_tokens, hidden_dim]
+        # IMPORTANT: noisy_actions should be [B, max_seq_len, hidden_dim], NOT [B, num_tokens, hidden_dim]
+        x = noisy_actions  # [B, max_seq_len, hidden_dim]
+        
+        # CRITICAL: Add positional embeddings so model can distinguish token positions
+        # Without this, all tokens look identical and model outputs same action everywhere
+        # Positional embedding uses max_seq_len (action sequence length), not num_tokens (state grid size)
+        x = self.action_pos_embed(x)  # [B, max_seq_len, hidden_dim]
         
         # Apply DiT blocks with conditioning
         for block in self.blocks:
@@ -126,7 +154,7 @@ class DiffusionPolicy(nn.Module):
         
         # Output head
         x = self.final_norm(x)
-        logits = self.action_head(x)  # [B, num_tokens, num_actions]
+        logits = self.action_head(x)  # [B, max_seq_len, num_actions]
         
         return logits
     
@@ -141,22 +169,22 @@ class DiffusionPolicy(nn.Module):
         Single denoising step (for MCTD inference).
         
         Args:
-            hidden_actions: [B, num_tokens, hidden_dim]
-            state: state dict
+            hidden_actions: [B, max_seq_len, hidden_dim] (action sequence, NOT state tokens!)
+            state: state dict (grid is encoded to num_tokens=361, then pooled to conditioning)
             t: [B] current noise level in [0, 1]
             guidance_scale: float, classifier-free guidance strength
         
         Returns:
-            [B, num_tokens, hidden_dim] less noisy hidden actions
+            [B, max_seq_len, hidden_dim] less noisy hidden actions
         """
         # Forward pass to get action logits
-        logits = self.forward(hidden_actions, state, t)  # [B, num_tokens, num_actions]
+        logits = self.forward(hidden_actions, state, t)  # [B, max_seq_len, num_actions]
         
         # Get predicted clean actions
-        pred_actions = logits.argmax(dim=-1)  # [B, num_tokens]
+        pred_actions = logits.argmax(dim=-1)  # [B, max_seq_len]
         
         # Encode to hidden space
-        clean_hidden = self.action_encoder(pred_actions)  # [B, num_tokens, hidden_dim]
+        clean_hidden = self.action_encoder(pred_actions)  # [B, max_seq_len, hidden_dim]
         
         # Denoising update: interpolate toward clean prediction
         # More clean as t → 0

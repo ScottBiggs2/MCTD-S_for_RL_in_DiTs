@@ -61,3 +61,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+cursor_spam/
+cursor_spam
+scratch.md 
+RESEARCH_DECISIONS.md
