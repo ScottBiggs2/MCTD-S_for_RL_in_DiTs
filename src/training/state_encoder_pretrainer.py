@@ -293,6 +293,8 @@ class StateEncoderPretrainer:
                 else:
                     grid_reshaped = grid.permute(0, 3, 1, 2)
             
+            # Normalize by max possible value (11) to get [0, 1] range
+            # Encoding: goal=8 (0.727), agent=10 (0.909), agent+goal=11 (1.0)
             target_grid = grid_reshaped.float() / 11.0  # Normalize indices [0-11] to [0-1]
             
             # Losses
@@ -418,6 +420,7 @@ class StateEncoderPretrainer:
                 5: (255, 165, 0),   # key - orange
                 8: (0, 255, 0),     # goal - green
                 10: (255, 0, 0),    # agent - red
+                11: (255, 165, 0),  # agent+goal - orange (both present)
             }
             
             # Color map for colors (if object has color)
@@ -444,6 +447,8 @@ class StateEncoderPretrainer:
                             rgb[b, h, w] = (0, 255, 0)  # green
                         elif obj == 10:  # agent
                             rgb[b, h, w] = (255, 0, 0)  # red
+                        elif obj == 11:  # agent+goal (both present)
+                            rgb[b, h, w] = (255, 165, 0)  # orange (distinct from both)
                         elif obj == 4:  # door
                             if col in color_map:
                                 rgb[b, h, w] = tuple(int(c * 0.7) for c in color_map[col])  # darker

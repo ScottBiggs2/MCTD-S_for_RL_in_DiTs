@@ -50,7 +50,7 @@ class TrainingConfig:
     num_epochs: int = 100  # Number of training epochs
     
     # Diffusion
-    num_diffusion_steps: int = 1000  # Number of diffusion timesteps (for noise scheduling)
+    num_diffusion_steps: int = 100  # Number of diffusion timesteps (for noise scheduling)
     mask_schedule: str = "cosine"  # Masking schedule: 'cosine', 'linear', or 'constant'
     
     # Curriculum learning for masking (gradually increase difficulty)

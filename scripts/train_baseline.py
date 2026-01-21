@@ -18,12 +18,17 @@ from src.utils.checkpointing import save_checkpoint
 from src.config import get_experiment_config
 
 
-def load_dataset(data_path, max_seq_len=64):
+def load_dataset(data_path, max_seq_len=64, use_augmentation=True, grid_size=19):
     """Load trajectory dataset from pickle file."""
     with open(data_path, 'rb') as f:
         trajectories = pickle.load(f)
     
-    return TrajectoryDataset(trajectories, max_seq_len=max_seq_len)
+    return TrajectoryDataset(
+        trajectories, 
+        max_seq_len=max_seq_len,
+        use_augmentation=use_augmentation,
+        grid_size=grid_size,
+    )
 
 
 def main():
@@ -83,11 +88,31 @@ def main():
     train_path = data_dir / f"{env_name}_train.pkl"
     test_path = data_dir / f"{env_name}_test.pkl"
     
+    # Determine grid size from environment name
+    # FourRooms is 19x19, Empty-8x8 is 8x8, etc.
+    grid_size_map = {
+        'MiniGrid-FourRooms-v0': 19,
+        'MiniGrid-Empty-8x8-v0': 8,
+        'FourRooms': 19,
+        'Empty-8x8': 8,
+    }
+    grid_size = grid_size_map.get(env_name, 19)  # Default to 19 for FourRooms
+    
     print(f"Loading train data from {train_path}")
-    train_dataset = load_dataset(train_path, max_seq_len=config['max_seq_len'])
+    train_dataset = load_dataset(
+        train_path, 
+        max_seq_len=config['max_seq_len'],
+        use_augmentation=True,  # Enable augmentation for 4x effective data
+        grid_size=grid_size,
+    )
     
     print(f"Loading test data from {test_path}")
-    val_dataset = load_dataset(test_path, max_seq_len=config['max_seq_len'])
+    val_dataset = load_dataset(
+        test_path, 
+        max_seq_len=config['max_seq_len'],
+        use_augmentation=False,  # No augmentation on validation set
+        grid_size=grid_size,
+    )
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")

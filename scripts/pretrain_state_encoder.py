@@ -15,7 +15,10 @@ import numpy as np
 import pickle
 from pathlib import Path
 from torch.utils.data import DataLoader
+from typing import Optional
 import gymnasium as gym
+import random
+import torch.nn.functional as F
 
 # Import minigrid to register environments
 try:
@@ -68,21 +71,28 @@ def extract_positions_from_grid(grid: np.ndarray, env: gym.Env) -> tuple:
     return agent_pos, goal_pos
 
 
+# Import augmentation function from shared utility
+from src.utils.data_augmentation import apply_grid_augmentation
+
+
 class PretrainingDataset:
     """
     Dataset for state encoder pretraining.
     
     Extracts agent and goal positions from trajectories.
+    Supports data augmentation via rotation and reflection.
     """
     def __init__(
         self,
         trajectories: list,
         env_name: str,
         grid_size: int = 19,
+        use_augmentation: bool = True,
     ):
         self.trajectories = trajectories
         self.env_name = env_name
         self.grid_size = grid_size
+        self.use_augmentation = use_augmentation
         
         # Pre-extract positions for all trajectories
         print("Extracting agent and goal positions from trajectories...")
@@ -146,7 +156,30 @@ class PretrainingDataset:
         return len(self.data)
     
     def __getitem__(self, idx):
-        return self.data[idx]
+        sample = self.data[idx]
+        
+        # Apply random augmentation if enabled
+        if self.use_augmentation and random.random() < 0.75:  # 75% chance of augmentation
+            aug_types = ['rot90', 'rot180', 'rot270', 'hflip', 'vflip']
+            aug_type = random.choice(aug_types)
+            
+            grid_aug, agent_pos_aug, goal_pos_aug, direction_aug = apply_grid_augmentation(
+                sample['grid'],
+                sample['agent_pos'],
+                sample['goal_pos'],
+                sample['direction'],
+                self.grid_size,
+                aug_type
+            )
+            
+            return {
+                'grid': grid_aug,
+                'direction': direction_aug,
+                'agent_pos': agent_pos_aug,
+                'goal_pos': goal_pos_aug,
+            }
+        else:
+            return sample
 
 
 def collate_fn(batch):
@@ -234,12 +267,13 @@ def main():
     
     print(f"Loaded {len(trajectories)} trajectories")
     
-    # Create dataset
+    # Create dataset with augmentation
     print("Creating pretraining dataset...")
     dataset = PretrainingDataset(
         trajectories=trajectories,
         env_name=args.env,
         grid_size=args.grid_size,
+        use_augmentation=True,  # Enable augmentation for 4x effective data
     )
     
     # Split train/val (80/20)

@@ -36,10 +36,15 @@ from src.config import get_model_config, get_mctd_config, load_config_from_dict
 from src.environments.minigrid_wrapper import get_full_grid_image
 
 
-def load_model(checkpoint_path: str, device: str = 'cpu') -> DiffusionPolicy:
+def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encoder_path: Optional[str] = None) -> DiffusionPolicy:
     """Load trained model from checkpoint.
     
     Attempts to load config from checkpoint. Falls back to default config if not found.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: Device to load on
+        pretrained_state_encoder_path: Optional path to pretrained state encoder checkpoint
     """
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
@@ -82,6 +87,46 @@ def load_model(checkpoint_path: str, device: str = 'cpu') -> DiffusionPolicy:
             model.load_state_dict(checkpoint, strict=False)
     else:
         model.load_state_dict(checkpoint, strict=False)
+    
+    # Load pretrained state encoder if specified
+    if pretrained_state_encoder_path:
+        pretrained_path = Path(pretrained_state_encoder_path)
+        if not pretrained_path.exists():
+            print(f"\n⚠️  Warning: Pretrained state encoder path '{pretrained_state_encoder_path}' not found!")
+            print("  Continuing without pretrained encoder...")
+        else:
+            print(f"\n{'='*60}")
+            print(f"Loading pretrained state encoder from {pretrained_state_encoder_path}")
+            print(f"{'='*60}")
+            state_encoder_checkpoint = torch.load(pretrained_state_encoder_path, map_location=device)
+            
+            if isinstance(state_encoder_checkpoint, dict) and 'model_state_dict' in state_encoder_checkpoint:
+                state_dict = state_encoder_checkpoint['model_state_dict']
+                checkpoint_config = state_encoder_checkpoint.get('config', {})
+            else:
+                state_dict = state_encoder_checkpoint
+                checkpoint_config = {}
+            
+            # Check for hidden_dim mismatch
+            if checkpoint_config:
+                pretrained_hidden_dim = checkpoint_config.get('hidden_dim')
+                current_hidden_dim = model_config.get('hidden_dim')
+                if pretrained_hidden_dim and pretrained_hidden_dim != current_hidden_dim:
+                    print(f"\n⚠️  WARNING: Hidden dimension mismatch!")
+                    print(f"  Pretrained encoder: hidden_dim={pretrained_hidden_dim}")
+                    print(f"  Current model: hidden_dim={current_hidden_dim}")
+                    print(f"  This may cause loading errors!")
+            
+            # Load state encoder weights (filter out decoder/auxiliary heads)
+            encoder_state_dict = {}
+            for k, v in state_dict.items():
+                # Skip decoder and auxiliary heads
+                if 'decoder' not in k and 'agent_pos_head' not in k and 'goal_pos_head' not in k and 'direction_head' not in k:
+                    encoder_state_dict[k] = v
+            
+            # Load into model's state encoder
+            model.state_encoder.load_state_dict(encoder_state_dict, strict=False)
+            print("✓ Pretrained state encoder loaded (decoder/auxiliary heads ignored)")
     
     model.eval()
     return model.to(device)
@@ -493,6 +538,8 @@ def main():
                        help='Enable intermediate rewards based on Manhattan distance to goal')
     parser.add_argument('--distance_reward_scale', type=float, default=0.1,
                        help='Scale factor for distance-based rewards (default 0.1)')
+    parser.add_argument('--pretrained_state_encoder', type=str, default=None,
+                       help='Path to pretrained state encoder checkpoint (from Stage 1 pretraining)')
     
     args = parser.parse_args()
     
@@ -501,7 +548,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
     
     print(f"Loading model from {args.checkpoint}...")
-    model = load_model(args.checkpoint, device=args.device)
+    model = load_model(args.checkpoint, device=args.device, pretrained_state_encoder_path=args.pretrained_state_encoder)
     model = model.to(args.device)
     
     print(f"Loading test trajectories from {args.data}...")

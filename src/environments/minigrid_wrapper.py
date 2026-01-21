@@ -98,16 +98,34 @@ def get_full_grid_image(env) -> np.ndarray:
             image[i, j, 2] = state_idx
             
             # Mark agent position (override cell if agent is here)
+            # IMPORTANT ENCODING SCHEME:
+            # - Channel 0 (object type): encodes object type, with special handling for agent
+            #   - Goal: 8
+            #   - Agent (not on goal): 10
+            #   - Agent on goal: 11 (preserves goal information)
+            # - Channel 1 (color): preserved from underlying cell
+            # - Channel 2 (state): agent direction when agent present, otherwise cell state
+            #
+            # This ensures agent and goal are distinguishable even when normalized:
+            # - Goal: 8/11 = 0.727
+            # - Agent: 10/11 = 0.909
+            # - Agent+Goal: 11/11 = 1.0
             if agent_pos is not None and i == agent_pos[1] and j == agent_pos[0]:
-                # Agent encoding: use OBJECT_TO_IDX.get('agent', ...) or special value
-                # MiniGrid uses agent direction encoded in object type
-                # For now, use a special value for agent (will need to match MiniGrid's encoding)
-                # In partial obs, agent is encoded as direction value in channel 0
-                # But in full grid, we may need to use a different approach
-                # Let's use the agent direction + object type combination
-                # For compatibility, use the same encoding as partial obs when agent is present
-                image[i, j, 0] = 10  # Agent marker (will need refinement)
-                image[i, j, 2] = agent_dir  # Store direction in state channel
+                # Check if this cell is a goal - if so, we need to preserve that info
+                is_goal = (obj_type_idx == OBJECT_TO_IDX.get('goal', 8))
+                
+                if is_goal:
+                    # Agent on goal: encode as special value that indicates both
+                    # Use 11 (one more than max normal object type 10) to indicate agent+goal
+                    # This makes it clearly distinct: goal=8 (0.727), agent=10 (0.909), agent+goal=11 (1.0)
+                    image[i, j, 0] = 11  # Special marker for agent+goal
+                else:
+                    # Agent on non-goal: use standard agent encoding
+                    image[i, j, 0] = 10  # Agent marker
+                
+                # Store direction in state channel (channel 2)
+                # This preserves agent orientation information
+                image[i, j, 2] = agent_dir
     
     # Convert to float32 and normalize (matching obs['image'] format)
     # MiniGrid observations use uint8, but we'll keep as uint8 for consistency
