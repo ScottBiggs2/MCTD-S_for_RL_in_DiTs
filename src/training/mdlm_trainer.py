@@ -148,38 +148,53 @@ class MaskedDiffusionTrainer:
         
         return mask_ratio
     
-    def create_mask(
+    def create_masked_input(
         self,
-        batch_size: int,
-        seq_len: int,
-        t: torch.Tensor
-    ) -> torch.Tensor:
+        actions: torch.Tensor,
+        lengths: torch.Tensor,
+    ):
         """
-        Create random mask with ratio determined by timestep.
-        
+        Create masked input using the model's MASK token (discrete MDLM).
+
         Args:
-            batch_size: Batch size
-            seq_len: Sequence length
-            t: [batch] timestep values
-        
+            actions: [B, seq_len] ground-truth action IDs
+            lengths: [B] actual (unpadded) sequence lengths
+
         Returns:
-            [batch, seq_len] binary mask (1 = masked position)
+            masked_actions: [B, seq_len] with some positions = mask_token_id
+            mask: [B, seq_len] boolean tensor, True = masked position
+            mask_ratio: [B] actual mask ratio per sample
         """
-        mask_ratio = self.get_mask_ratio(t)  # [batch]
-        
-        # Random masks for each sequence
-        masks = []
-        for i in range(batch_size):
-            num_masked = int(seq_len * mask_ratio[i].item())
-            num_masked = max(1, min(num_masked, seq_len - 1))  # At least 1, at most seq_len-1
-            
-            # Random positions to mask
-            mask_indices = torch.randperm(seq_len, device=self.device)[:num_masked]
-            mask = torch.zeros(seq_len, device=self.device, dtype=torch.bool)
-            mask[mask_indices] = True
-            masks.append(mask)
-        
-        return torch.stack(masks)  # [batch, seq_len]
+        B, seq_len = actions.shape
+        device = actions.device
+
+        # Sample timestep per sample and map to target mask ratio
+        t = torch.rand(B, device=device)
+        target_mask_ratio = self.get_mask_ratio(t)  # [B]
+
+        # Initial random mask
+        rand = torch.rand(B, seq_len, device=device)
+        mask = rand < target_mask_ratio.unsqueeze(1)  # [B, seq_len]
+
+        # Do not mask padding positions
+        pos_idx = torch.arange(seq_len, device=device).unsqueeze(0)
+        valid = pos_idx < lengths.unsqueeze(1)
+        mask = mask & valid
+
+        # Ensure at least one masked position per sequence (if any valid positions)
+        for b in range(B):
+            if not mask[b].any() and lengths[b] > 0:
+                valid_positions = valid[b].nonzero(as_tuple=True)[0]
+                if valid_positions.numel() > 0:
+                    j = torch.randint(valid_positions.numel(), (1,), device=device)
+                    mask[b, valid_positions[j]] = True
+
+        masked_actions = actions.clone()
+        masked_actions[mask] = self.model.mask_token_id
+
+        actual_mask_ratio = mask.float().sum(dim=1) / lengths.float().clamp(min=1)
+
+        return masked_actions, mask, actual_mask_ratio
     
     def train_step(self, batch: Dict) -> Dict[str, float]:
         """
@@ -196,54 +211,41 @@ class MaskedDiffusionTrainer:
         # Unpack batch
         states = {k: v.to(self.device) for k, v in batch['states'].items()}
         actions = batch['actions'].to(self.device)  # [B, seq_len]
+        lengths = batch.get('length', torch.full_like(actions[:, 0], actions.shape[1])).to(self.device)
         
         B, seq_len = actions.shape
-        max_seq_len = self.model.max_seq_len  # 32 (action sequence length)
-        
-        # Sample random timestep
-        t = torch.rand(B, device=self.device)  # [B] in [0, 1]
-        
-        # Encode actions to hidden space
-        clean_hidden = self.model.action_encoder(actions)  # [B, seq_len, hidden_dim]
-        
-        # Pad/truncate to max_seq_len if needed (NOT num_tokens - that's for state encoding!)
-        if seq_len != max_seq_len:
-            if seq_len < max_seq_len:
-                # Pad with last action
-                padding = clean_hidden[:, -1:, :].expand(B, max_seq_len - seq_len, -1)
-                clean_hidden = torch.cat([clean_hidden, padding], dim=1)
-                actions_padded = torch.cat([
-                    actions,
-                    actions[:, -1:].expand(B, max_seq_len - seq_len)
-                ], dim=1)
-            else:
-                # Truncate to max_seq_len
-                clean_hidden = clean_hidden[:, :max_seq_len, :]
-                actions_padded = actions[:, :max_seq_len]
+        max_seq_len = self.model.max_seq_len
+
+        # Pad / truncate discrete actions to max_seq_len
+        if seq_len < max_seq_len:
+            pad_value = 0  # treat as some valid (but rarely used) action
+            padding = torch.full(
+                (B, max_seq_len - seq_len),
+                pad_value,
+                dtype=torch.long,
+                device=self.device,
+            )
+            actions_padded = torch.cat([actions, padding], dim=1)
+        elif seq_len > max_seq_len:
+            actions_padded = actions[:, :max_seq_len]
+            lengths = lengths.clamp(max=max_seq_len)
         else:
-            # seq_len == max_seq_len, no padding/truncation needed
             actions_padded = actions
-        
-        # Create mask for action sequence (max_seq_len, not num_tokens)
-        mask = self.create_mask(B, max_seq_len, t)  # [B, max_seq_len]
-        
-        # Add noise to masked positions
-        noise = torch.randn_like(clean_hidden)
-        noisy_hidden = torch.where(
-            mask[..., None],
-            noise,
-            clean_hidden
+
+        # Create masked input using MASK token, not Gaussian noise
+        masked_actions, mask, mask_ratio = self.create_masked_input(
+            actions_padded, lengths
         )
-        
-        # Forward pass
-        logits = self.model(noisy_hidden, states, t, mask)  # [B, max_seq_len, num_actions]
+
+        # Forward pass: model embeds masked_actions internally
+        logits = self.model(masked_actions, states, mask_ratio)  # [B, max_seq_len, num_actions]
         
         # Compute loss only on masked positions
         loss_per_token = self.criterion(
             logits.reshape(-1, self.model.num_actions),
-            actions_padded.reshape(-1)
+            actions_padded.reshape(-1),
         ).reshape(B, max_seq_len)
-        
+
         loss = (loss_per_token * mask.float()).sum() / mask.sum().clamp(min=1)
         
         # Backward
@@ -255,12 +257,13 @@ class MaskedDiffusionTrainer:
         # Metrics
         with torch.no_grad():
             pred_actions = logits.argmax(dim=-1)
-            accuracy = ((pred_actions == actions_padded) * mask).sum() / mask.sum()
+            correct = ((pred_actions == actions_padded) & mask).sum().float()
+            accuracy = correct / mask.sum().clamp(min=1)
         
         return {
             'loss': loss.item(),
             'accuracy': accuracy.item(),
-            'mask_ratio': mask.float().mean().item(),
+            'mask_ratio': mask_ratio.mean().item(),
         }
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -291,52 +294,55 @@ class MaskedDiffusionTrainer:
         for batch in tqdm(self.val_loader, desc="Evaluating"):
             states = {k: v.to(self.device) for k, v in batch['states'].items()}
             actions = batch['actions'].to(self.device)
+            lengths = batch.get('length', torch.full_like(actions[:, 0], actions.shape[1])).to(self.device)
             
             B, seq_len = actions.shape
             max_seq_len = self.model.max_seq_len  # Use max_seq_len, not num_tokens!
             
-            # Fixed timestep for evaluation
-            t = torch.ones(B, device=self.device) * 0.5
-            
-            # Encode actions
-            clean_hidden = self.model.action_encoder(actions)
-            
-            # Pad/truncate to max_seq_len
-            if seq_len != max_seq_len:
-                if seq_len < max_seq_len:
-                    padding = clean_hidden[:, -1:, :].expand(B, max_seq_len - seq_len, -1)
-                    clean_hidden = torch.cat([clean_hidden, padding], dim=1)
-                    actions_padded = torch.cat([
-                        actions,
-                        actions[:, -1:].expand(B, max_seq_len - seq_len)
-                    ], dim=1)
-                else:
-                    clean_hidden = clean_hidden[:, :max_seq_len, :]
-                    actions_padded = actions[:, :max_seq_len]
+            # Pad/truncate actions to max_seq_len
+            if seq_len < max_seq_len:
+                pad_value = 0
+                padding = torch.full(
+                    (B, max_seq_len - seq_len),
+                    pad_value,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                actions_padded = torch.cat([actions, padding], dim=1)
+            elif seq_len > max_seq_len:
+                actions_padded = actions[:, :max_seq_len]
+                lengths = lengths.clamp(max=max_seq_len)
             else:
                 actions_padded = actions
-            
-            # Create mask for action sequence
-            mask = self.create_mask(B, max_seq_len, t)
-            
-            # Add noise
-            noise = torch.randn_like(clean_hidden)
-            noisy_hidden = torch.where(mask[..., None], noise, clean_hidden)
-            
+
+            # Use fixed 50% mask ratio for validation
+            rand = torch.rand(B, max_seq_len, device=self.device)
+            mask = rand < 0.5
+
+            pos_idx = torch.arange(max_seq_len, device=self.device).unsqueeze(0)
+            valid = pos_idx < lengths.unsqueeze(1)
+            mask = mask & valid
+
+            masked_actions = actions_padded.clone()
+            masked_actions[mask] = self.model.mask_token_id
+
+            mask_ratio = (mask.float().sum(dim=1) / lengths.float().clamp(min=1))
+
             # Forward
-            logits = self.model(noisy_hidden, states, t, mask)
+            logits = self.model(masked_actions, states, mask_ratio)
             
             # Loss
             loss_per_token = self.criterion(
                 logits.reshape(-1, self.model.num_actions),
-                actions_padded.reshape(-1)
+                actions_padded.reshape(-1),
             ).reshape(B, max_seq_len)
-            
+
             loss = (loss_per_token * mask.float()).sum() / mask.sum().clamp(min=1)
             
             # Accuracy
             pred_actions = logits.argmax(dim=-1)
-            accuracy = ((pred_actions == actions_padded) * mask).sum() / mask.sum()
+            correct = ((pred_actions == actions_padded) & mask).sum().float()
+            accuracy = correct / mask.sum().clamp(min=1)
             
             metrics_sum['loss'] += loss.item()
             metrics_sum['accuracy'] += accuracy.item()

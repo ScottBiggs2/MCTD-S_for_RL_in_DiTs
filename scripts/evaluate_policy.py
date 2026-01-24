@@ -29,13 +29,17 @@ except ImportError:
 
 import gymnasium as gym
 from src.models.diffusion_policy import DiffusionPolicy
-from src.models.action_encoder import ActionEncoder
 from src.environments.trajectory_dataset import TrajectoryDataset
 from src.config import get_model_config, load_config_from_dict
 from src.environments.minigrid_wrapper import get_full_grid_image
 
 
-def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encoder_path: Optional[str] = None) -> DiffusionPolicy:
+def load_model(
+    checkpoint_path: str,
+    device: str = 'cpu',
+    pretrained_state_encoder_path: Optional[str] = None,
+    grid_size: int = 19,
+) -> DiffusionPolicy:
     """Load trained model from checkpoint.
     
     Args:
@@ -53,9 +57,9 @@ def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encod
             'hidden_dim': model_config_dict['hidden_dim'],
             'num_layers': model_config_dict['num_layers'],
             'num_heads': model_config_dict['num_heads'],
-            'num_tokens': model_config_dict['num_tokens'],
             'max_seq_len': model_config_dict['max_seq_len'],
             'dropout': model_config_dict['dropout'],
+            'grid_size': grid_size,
         }
     else:
         model_config_obj = get_model_config()
@@ -64,9 +68,9 @@ def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encod
             'hidden_dim': model_config_obj.hidden_dim,
             'num_layers': model_config_obj.num_layers,
             'num_heads': model_config_obj.num_heads,
-            'num_tokens': model_config_obj.num_tokens,
             'max_seq_len': model_config_obj.max_seq_len,
             'dropout': model_config_obj.dropout,
+            'grid_size': grid_size,
         }
     
     model = DiffusionPolicy(**model_config)
@@ -124,51 +128,34 @@ def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encod
 
 
 def direct_policy_decode(
-    model: DiffusionPolicy, 
-    state: Dict[str, torch.Tensor], 
-    device: str = 'cpu', 
+    model: DiffusionPolicy,
+    state: Dict[str, torch.Tensor],
+    device: str = 'cpu',
     num_denoise_steps: int = 20,
-    guidance_scale: float = 1.0
+    guidance_scale: float = 1.0,
 ) -> torch.Tensor:
     """
-    Direct policy decode: greedy action selection without search.
-    
+    Direct policy decode using the MDLM sampler (iterative unmasking).
+
     Args:
         model: DiffusionPolicy model
         state: State dict with 'grid' and 'direction'
         device: Device to run on
-        num_denoise_steps: Number of denoising steps (more = better quality, slower)
-        guidance_scale: Guidance scale for denoising (1.0 = standard)
-    
+        num_denoise_steps: Number of unmasking steps (passed to sampler)
+        guidance_scale: Unused (kept for API compatibility)
+
     Returns:
         actions: [seq_len] discrete action sequence
     """
     model.eval()
     with torch.no_grad():
-        seq_len = model.max_seq_len
-        
-        # Initialize from mean action embedding (forward action = 2)
-        init_actions = torch.full((1, seq_len), 2, dtype=torch.long, device=device)
-        init_hidden = model.action_encoder(init_actions)  # [1, seq_len, hidden_dim]
-        
-        # Add noise scaled by timestep
-        noise = torch.randn_like(init_hidden)
-        hidden_state = init_hidden + 0.5 * noise
-        
-        # Denoise in steps
-        for i in range(num_denoise_steps):
-            t = 1.0 - (i + 1) / num_denoise_steps
-            t_tensor = torch.tensor([t], device=device)
-            hidden_state = model.denoise_step(hidden_state, state, t_tensor, guidance_scale=guidance_scale)
-        
-        # Final decode to actions
-        t_final = torch.tensor([0.0], device=device)
-        logits = model.forward(hidden_state, state, t_final)
-        actions = logits.argmax(dim=-1)[0]  # [seq_len]
-        
-        # Ensure actions are valid
+        actions = model.sample(
+            state=state,
+            seq_len=model.max_seq_len,
+            num_steps=num_denoise_steps,
+            temperature=1.0,
+        )[0]  # [seq_len]
         actions = torch.clamp(actions, 0, model.num_actions - 1)
-        
         return actions.cpu()
 
 
@@ -353,20 +340,27 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     
+    # Infer grid size from environment name
+    grid_size_map = {
+        'MiniGrid-FourRooms-v0': 19,
+        'MiniGrid-Empty-8x8-v0': 8,
+        'FourRooms': 19,
+        'Empty-8x8': 8,
+    }
+    grid_size = grid_size_map.get(args.env, 19)
+
     print(f"Loading model from {args.checkpoint}...")
-    model = load_model(args.checkpoint, device=args.device, pretrained_state_encoder_path=args.pretrained_state_encoder)
+    model = load_model(
+        args.checkpoint,
+        device=args.device,
+        pretrained_state_encoder_path=args.pretrained_state_encoder,
+        grid_size=grid_size,
+    )
     model = model.to(args.device)
     
     print(f"Loading test trajectories from {args.data}...")
     with open(args.data, 'rb') as f:
         test_trajectories = pickle.load(f)
-    
-    print(f"Creating action encoder...")
-    model_config_obj = get_model_config()
-    action_encoder = ActionEncoder(
-        num_actions=model_config_obj.num_actions,
-        hidden_dim=model.hidden_dim
-    ).to(args.device)
     
     print(f"\n=== Evaluating Raw DiT Policy ===")
     print(f"Denoising steps: {args.num_denoise_steps}")

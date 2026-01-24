@@ -75,10 +75,8 @@ class HiddenSpaceMCTD:
         self.initial_seed = initial_seed  # Store seed for consistent environment resets
         
         # Store model parameters for shape inference
-        # IMPORTANT: num_tokens is for state encoding (361 grid cells), max_seq_len is for action sequences (32 actions)
-        self.num_tokens = self.model.num_tokens  # For state encoding only (e.g., 361 for 19x19 grid)
         self.hidden_dim = self.model.hidden_dim
-        self.max_seq_len = self.model.max_seq_len  # For action sequences (e.g., 32 actions)
+        self.max_seq_len = self.model.max_seq_len  # For action sequences
     
     @torch.no_grad()
     def search(

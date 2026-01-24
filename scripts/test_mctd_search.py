@@ -36,7 +36,12 @@ from src.config import get_model_config, get_mctd_config, load_config_from_dict
 from src.environments.minigrid_wrapper import get_full_grid_image
 
 
-def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encoder_path: Optional[str] = None) -> DiffusionPolicy:
+def load_model(
+    checkpoint_path: str,
+    device: str = 'cpu',
+    pretrained_state_encoder_path: Optional[str] = None,
+    grid_size: int = 19,
+) -> DiffusionPolicy:
     """Load trained model from checkpoint.
     
     Attempts to load config from checkpoint. Falls back to default config if not found.
@@ -59,9 +64,9 @@ def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encod
             'hidden_dim': model_config_dict['hidden_dim'],
             'num_layers': model_config_dict['num_layers'],
             'num_heads': model_config_dict['num_heads'],
-            'num_tokens': model_config_dict['num_tokens'],
             'max_seq_len': model_config_dict['max_seq_len'],
             'dropout': model_config_dict['dropout'],
+            'grid_size': grid_size,
         }
     else:
         # Use default config (ensure it matches training config)
@@ -71,9 +76,9 @@ def load_model(checkpoint_path: str, device: str = 'cpu', pretrained_state_encod
             'hidden_dim': model_config_obj.hidden_dim,
             'num_layers': model_config_obj.num_layers,
             'num_heads': model_config_obj.num_heads,
-            'num_tokens': model_config_obj.num_tokens,
             'max_seq_len': model_config_obj.max_seq_len,
             'dropout': model_config_obj.dropout,
+            'grid_size': grid_size,
         }
     
     # Create model with config
@@ -139,48 +144,24 @@ def load_test_trajectories(data_path: str) -> List[Dict]:
     return trajectories
 
 
-def direct_policy_decode(model: DiffusionPolicy, state: Dict[str, torch.Tensor], 
-                       device: str = 'cpu', num_steps: int = 64) -> torch.Tensor:
+def direct_policy_decode(
+    model: DiffusionPolicy,
+    state: Dict[str, torch.Tensor],
+    device: str = 'cpu',
+    num_steps: int = 64,
+) -> torch.Tensor:
     """
-    Direct policy decode: greedy action selection without search.
-    
-    Simulates full denoising process from t=1 to t=0.
-    
-    IMPORTANT: At t=1.0, all positions should be masked (pure noise), matching training.
-    We initialize with pure noise, not action embeddings!
+    Direct policy decode using MDLM iterative unmasking (no hidden-state denoising).
     """
     model.eval()
     with torch.no_grad():
-        seq_len = model.max_seq_len  # Use max_seq_len (action sequence length), not num_tokens (state grid size)
-        
-        # Initialize with pure noise (all positions masked at t=1.0)
-        # This matches training: at t=1.0, mask ratio → 1.0, so all positions get noise
-        # NOT action 2 embeddings - those would be wrong!
-        hidden_state = torch.randn(
-            1, seq_len, model.hidden_dim,
-            device=device
-        )  # [1, seq_len, hidden_dim] - pure noise, all positions masked
-        
-        # Denoise in steps (simulate diffusion process)
-        num_denoise_steps = 20  # More steps for better denoising
-        for i in range(num_denoise_steps):
-            t = 1.0 - (i + 1) / num_denoise_steps
-            t_tensor = torch.tensor([t], device=device)
-            
-            hidden_state = model.denoise_step(hidden_state, state, t_tensor, guidance_scale=1.0)
-        
-        # Final decode to actions
-        t_final = torch.tensor([0.0], device=device)
-        logits = model.forward(hidden_state, state, t_final)
-        actions = logits.argmax(dim=-1)[0]  # [seq_len]
-        
-        # Ensure actions are valid (0-6)
+        actions = model.sample(
+            state=state,
+            seq_len=min(model.max_seq_len, num_steps),
+            num_steps=20,
+            temperature=1.0,
+        )[0]
         actions = torch.clamp(actions, 0, model.num_actions - 1)
-        
-        # Truncate to actual length
-        if len(actions) > num_steps:
-            actions = actions[:num_steps]
-        
         return actions.cpu()
 
 
@@ -547,8 +528,22 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     
+    # Infer grid size from environment name
+    grid_size_map = {
+        'MiniGrid-FourRooms-v0': 19,
+        'MiniGrid-Empty-8x8-v0': 8,
+        'FourRooms': 19,
+        'Empty-8x8': 8,
+    }
+    grid_size = grid_size_map.get(args.env, 19)
+
     print(f"Loading model from {args.checkpoint}...")
-    model = load_model(args.checkpoint, device=args.device, pretrained_state_encoder_path=args.pretrained_state_encoder)
+    model = load_model(
+        args.checkpoint,
+        device=args.device,
+        pretrained_state_encoder_path=args.pretrained_state_encoder,
+        grid_size=grid_size,
+    )
     model = model.to(args.device)
     
     print(f"Loading test trajectories from {args.data}...")

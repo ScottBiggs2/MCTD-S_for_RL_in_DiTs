@@ -9,7 +9,8 @@ class DiTBlock(nn.Module):
     """
     Transformer block with adaptive layer norm (DiT style).
     
-    Conditions on timestep embedding for adaptive normalization.
+    Conditions on a generic conditioning embedding (e.g., mask ratio or timestep)
+    for adaptive normalization (AdaLN).
     """
     def __init__(self, hidden_dim, num_heads, dropout=0.1):
         super().__init__()
@@ -44,17 +45,17 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_dim, hidden_dim * 6)
         )
     
-    def forward(self, x, t_emb):
+    def forward(self, x, cond_emb):
         """
         Args:
             x: [batch, seq_len, hidden_dim] input tokens
-            t_emb: [batch, hidden_dim] timestep embedding
+            cond_emb: [batch, hidden_dim] conditioning embedding
         
         Returns:
             [batch, seq_len, hidden_dim] output tokens
         """
-        # Generate adaptive LayerNorm parameters from timestep
-        ada_params = self.adaLN(t_emb)  # [batch, hidden_dim * 6]
+        # Generate adaptive LayerNorm parameters from conditioning embedding
+        ada_params = self.adaLN(cond_emb)  # [batch, hidden_dim * 6]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             ada_params.chunk(6, dim=-1)
         

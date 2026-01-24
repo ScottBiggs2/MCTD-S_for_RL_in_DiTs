@@ -1,7 +1,8 @@
 """
 Diffusion Policy for action sequences.
 
-Masked Diffusion Language Model operating on continuous hidden representations.
+Masked Diffusion Language Model (MDLM) operating on discrete action IDs with
+MASK tokens, following the architecture described in `mdlm-fix-guide.md`.
 """
 import torch
 import torch.nn as nn
@@ -9,7 +10,6 @@ from typing import Dict, Optional
 
 from .state_cnn_encoder import StateCNNEncoder
 from .action_encoder import ActionEncoder
-from .components.timestep_embed import SinusoidalPositionEmbedding
 from .components.dit_block import DiTBlock
 from .components.position_embedding import PositionalEmbedding
 
@@ -18,23 +18,11 @@ class DiffusionPolicy(nn.Module):
     """
     Masked Diffusion Language Model for action sequences.
     
-    Operates on continuous hidden action representations (from CNN tokenizers),
-    denoises to discrete action logits.
-    
-    Architecture:
-        State (19x19 grid) -> StateEncoder -> [B, 361, 128] tokens -> POOLED to [B, 128] conditioning
-        Noisy Actions -> [B, 32, 128] hidden (max_seq_len actions, NOT num_tokens!)
-        + Timestep embedding [B, 128]
-        + State conditioning [B, 128]
-        ↓
-        DiT Blocks (num_layers)
-        ↓
-        Action Logits [B, 32, 7]
-    
-    IMPORTANT: 
-    - num_tokens (361) is for STATE encoding (19x19 grid cells) → pooled to conditioning vector
-    - max_seq_len (32) is for ACTION sequences → these are what we predict
-    - MiniGrid actions: 0=turn_left, 1=turn_right, 2=move_forward, 3=pickup, 4=drop, 5=toggle, 6=done
+    MDLM paradigm:
+    - Input: action sequence with some positions replaced by [MASK] token ID
+    - Output: logits over original actions at all positions
+    - Training: cross-entropy loss on MASKED positions only
+    - Inference: iterative unmasking from all-MASK to fully specified sequence
     """
     def __init__(
         self,
@@ -42,54 +30,38 @@ class DiffusionPolicy(nn.Module):
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
-        num_tokens=49,  # Default: 7x7 grid, but can be larger (e.g., 361 for 19x19)
         max_seq_len=64,
         dropout=0.1,
-        grid_size=None,  # If None, inferred from num_tokens (assumes square grid)
+        grid_size=19,
     ):
         super().__init__()
         self.num_actions = num_actions
         self.hidden_dim = hidden_dim
-        self.num_tokens = num_tokens
         self.max_seq_len = max_seq_len
+        self.mask_token_id = num_actions  # [MASK] token index
         
-        # Infer grid_size from num_tokens if not provided
-        if grid_size is None:
-            grid_size = int(num_tokens ** 0.5)
-            if grid_size * grid_size != num_tokens:
-                raise ValueError(
-                    f"Cannot infer grid_size from num_tokens={num_tokens}. "
-                    f"Expected num_tokens to be a perfect square, got {num_tokens}"
-                )
         self.grid_size = grid_size
         
-        # State encoder: Simple CNN that outputs single embedding vector (CLIP-style)
+        # State encoder: CNN that outputs single embedding vector [B, hidden_dim]
         self.state_encoder = StateCNNEncoder(
             grid_size=grid_size,
             hidden_dim=hidden_dim,
             num_channels=3,
         )
         
-        # Action encoder for converting discrete actions to hidden space
+        # Action encoder with MASK token support
         self.action_encoder = ActionEncoder(num_actions, hidden_dim)
         
-        # Timestep embedding
-        self.time_embed = nn.Sequential(
-            SinusoidalPositionEmbedding(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim * 4),
+        # Optional mask ratio embedding (scalar ∈ [0,1] → [B, hidden_dim])
+        self.mask_ratio_embed = nn.Sequential(
+            nn.Linear(1, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
         )
         
-        # State conditioning: StateCNNEncoder directly outputs [B, hidden_dim]
-        # No projection needed - encoder already outputs single vector (CLIP-style)
-        
         # Positional embeddings for action tokens
-        # CRITICAL: Without this, model can't distinguish token positions!
-        # IMPORTANT: Use max_seq_len (not num_tokens) - we predict action sequences, not state tokens!
-        # num_tokens is for state encoding (361 grid cells), but actions are a sequence (32 actions)
         self.action_pos_embed = PositionalEmbedding(
-            num_tokens=max_seq_len,  # Action sequence length, not state grid size!
+            num_tokens=max_seq_len,
             hidden_dim=hidden_dim
         )
         
@@ -99,112 +71,130 @@ class DiffusionPolicy(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # Output head
+        # Output head: predict logits over REAL actions only (exclude MASK)
         self.final_norm = nn.LayerNorm(hidden_dim)
-        # Output action logits per token
         self.action_head = nn.Linear(hidden_dim, num_actions)
     
     def forward(
         self,
-        noisy_actions: torch.Tensor,
+        masked_actions: torch.Tensor,
         state: Dict[str, torch.Tensor],
-        t: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask_ratio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Denoise action sequence conditioned on state and timestep.
-        
-        IMPORTANT: 
-        - State encoding produces num_tokens (361 for 19x19 grid) which are POOLED to conditioning
-        - Action prediction produces max_seq_len (32) actions, NOT num_tokens actions
+        Predict original actions from a masked action sequence.
         
         Args:
-            noisy_actions: [B, max_seq_len, hidden_dim] continuous hidden action states
-            state: dict with 'grid' [B, H, W, 3] (e.g., [B, 19, 19, 3]) and 'direction' [B]
-            t: [B] diffusion timestep in [0, 1]
-            mask: [B, max_seq_len] binary mask (1 = masked position), optional
+            masked_actions: [B, max_seq_len] discrete action IDs with some positions
+                equal to `mask_token_id` (MASK).
+            state: dict with 'grid' [B, H, W, 3] and 'direction' [B]
+            mask_ratio: [B] fraction of positions masked (optional; used for conditioning)
         
         Returns:
-            [B, max_seq_len, num_actions] denoised action logits
+            logits: [B, max_seq_len, num_actions] over REAL actions (0..num_actions-1)
         """
-        B = noisy_actions.shape[0]
+        B, seq_len = masked_actions.shape
         
-        # Encode state to single embedding vector (CLIP-style conditioning)
-        # StateCNNEncoder directly outputs [B, hidden_dim] - no pooling needed
+        # Encode state to single vector
         state_cond = self.state_encoder(state)  # [B, hidden_dim]
-        
-        # Encode timestep
-        t_emb = self.time_embed(t)  # [B, hidden_dim]
-        
-        # Combine state and time conditioning
-        cond_emb = state_cond + t_emb  # [B, hidden_dim]
-        
-        # Input is already tokenized (noisy_actions are hidden representations)
-        # IMPORTANT: noisy_actions should be [B, max_seq_len, hidden_dim], NOT [B, num_tokens, hidden_dim]
-        x = noisy_actions  # [B, max_seq_len, hidden_dim]
-        
-        # CRITICAL: Add positional embeddings so model can distinguish token positions
-        # Without this, all tokens look identical and model outputs same action everywhere
-        # Positional embedding uses max_seq_len (action sequence length), not num_tokens (state grid size)
-        x = self.action_pos_embed(x)  # [B, max_seq_len, hidden_dim]
-        
+
+        # Encode masked actions (includes MASK embeddings)
+        x = self.action_encoder(masked_actions)  # [B, seq_len, hidden_dim]
+
+        # Positional embeddings over action positions
+        x = self.action_pos_embed(x)  # [B, seq_len, hidden_dim]
+
+        # Strong state conditioning: add to every token
+        x = x + state_cond.unsqueeze(1)  # [B, seq_len, hidden_dim]
+
+        # Optional mask-ratio conditioning using AdaLN cond vector
+        if mask_ratio is not None:
+            ratio_emb = self.mask_ratio_embed(mask_ratio.unsqueeze(-1))  # [B, hidden_dim]
+            cond_emb = ratio_emb
+        else:
+            cond_emb = torch.zeros(B, self.hidden_dim, device=x.device)
+
         # Apply DiT blocks with conditioning
         for block in self.blocks:
             x = block(x, cond_emb)
         
         # Output head
         x = self.final_norm(x)
-        logits = self.action_head(x)  # [B, max_seq_len, num_actions]
+        logits = self.action_head(x)  # [B, seq_len, num_actions]
         
         return logits
     
-    def denoise_step(
+    @torch.no_grad()
+    def sample(
         self,
-        hidden_actions: torch.Tensor,
         state: Dict[str, torch.Tensor],
-        t: torch.Tensor,
-        guidance_scale: float = 1.0
+        seq_len: int,
+        num_steps: int = 10,
+        temperature: float = 1.0,
     ) -> torch.Tensor:
         """
-        Single denoising step (for MCTD inference).
-        
+        Generate an action sequence via iterative unmasking.
+
         Args:
-            hidden_actions: [B, max_seq_len, hidden_dim] (action sequence, NOT state tokens!)
-            state: state dict (grid is encoded to num_tokens=361, then pooled to conditioning)
-            t: [B] current noise level in [0, 1]
-            guidance_scale: float, classifier-free guidance strength
-        
+            state: conditioning state dict
+            seq_len: desired sequence length (≤ max_seq_len)
+            num_steps: number of unmasking iterations
+            temperature: sampling temperature for softmax
+
         Returns:
-            [B, max_seq_len, hidden_dim] less noisy hidden actions
+            actions: [B, seq_len] generated discrete actions
         """
-        # Forward pass to get action logits
-        logits = self.forward(hidden_actions, state, t)  # [B, max_seq_len, num_actions]
-        
-        # Get predicted clean actions
-        pred_actions = logits.argmax(dim=-1)  # [B, max_seq_len]
-        
-        # Encode to hidden space
-        clean_hidden = self.action_encoder(pred_actions)  # [B, max_seq_len, hidden_dim]
-        
-        # Denoising update: interpolate toward clean prediction
-        # More clean as t → 0
-        alpha = 1.0 - t[:, None, None]  # [B, 1, 1]
-        denoised = alpha * clean_hidden + (1 - alpha) * hidden_actions
-        
-        # Optional: classifier-free guidance
-        if guidance_scale != 1.0:
-            # Compute unconditional prediction (masked state)
-            # For unconditional, we could mask the state or use zeros
-            # Simplified: use masked state
-            masked_state = {
-                'grid': torch.zeros_like(state['grid']),
-                'direction': torch.zeros_like(state['direction']),
-            }
-            uncond_logits = self.forward(hidden_actions, masked_state, t)
-            uncond_actions = uncond_logits.argmax(dim=-1)
-            uncond_hidden = self.action_encoder(uncond_actions)
-            
-            # Guidance: move away from uncond toward cond
-            denoised = uncond_hidden + guidance_scale * (denoised - uncond_hidden)
-        
-        return denoised
+        B = state["grid"].shape[0]
+        device = state["grid"].device
+
+        seq_len = min(seq_len, self.max_seq_len)
+
+        # Start from all-MASK sequence
+        actions = torch.full(
+            (B, seq_len),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        is_masked = torch.ones(B, seq_len, dtype=torch.bool, device=device)
+
+        for step in range(num_steps):
+            # Decreasing mask ratio over steps
+            mask_ratio_val = 1.0 - float(step + 1) / num_steps
+            mask_ratio = torch.full((B,), mask_ratio_val, device=device)
+
+            logits = self.forward(actions, state, mask_ratio)  # [B, seq_len, num_actions]
+            probs = torch.softmax(logits / max(temperature, 1e-6), dim=-1)
+
+            confidence, predicted = probs.max(dim=-1)  # [B, seq_len]
+
+            # Only consider still-masked positions
+            confidence = confidence.masked_fill(~is_masked, -float("inf"))
+
+            num_masked = is_masked.sum(dim=1)  # [B]
+            num_to_unmask = torch.ceil(
+                num_masked / max(num_steps - step, 1)
+            ).long()
+
+            for b in range(B):
+                if num_to_unmask[b] <= 0 or num_masked[b] == 0:
+                    continue
+                masked_indices = is_masked[b].nonzero(as_tuple=True)[0]
+                if masked_indices.numel() == 0:
+                    continue
+                conf_at_masked = confidence[b, masked_indices]
+                k = min(num_to_unmask[b].item(), masked_indices.numel())
+                _, top_idx = conf_at_masked.topk(k)
+                unmask_pos = masked_indices[top_idx]
+
+                actions[b, unmask_pos] = predicted[b, unmask_pos]
+                is_masked[b, unmask_pos] = False
+
+        # Final clean-up: any remaining MASKs get a final prediction
+        if is_masked.any():
+            mask_ratio = torch.zeros(B, device=device)
+            logits = self.forward(actions, state, mask_ratio)
+            final_pred = logits.argmax(dim=-1)
+            actions = torch.where(is_masked, final_pred, actions)
+
+        return actions

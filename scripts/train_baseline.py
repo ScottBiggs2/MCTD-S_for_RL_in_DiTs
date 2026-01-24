@@ -141,9 +141,9 @@ def main():
         hidden_dim=config['hidden_dim'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
-        num_tokens=config['num_tokens'],
         max_seq_len=config['max_seq_len'],
         dropout=config['dropout'],
+        grid_size=grid_size,
     )
     
     # Load pretrained state encoder if specified
